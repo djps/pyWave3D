@@ -1,5 +1,7 @@
 # pyWave3D
 
+[![CI](https://github.com/djps/pyWave3D/actions/workflows/ci.yml/badge.svg)](https://github.com/djps/pyWave3D/actions/workflows/ci.yml)
+
 Pseudo-spectral spatial-marching scheme for nonlinear ultrasound from holography data.
 
 pyWave3D computes nonlinear ultrasound beams in three dimensions. It reads JSON options files and source-plane inputs (for example a hologram measured on a plane in front of the transducer).
