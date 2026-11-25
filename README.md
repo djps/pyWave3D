@@ -2,6 +2,9 @@
 
 [![CI](https://github.com/djps/pyWave3D/actions/workflows/ci.yml/badge.svg)](https://github.com/djps/pyWave3D/actions/workflows/ci.yml)
 [![Coverage Status](https://coveralls.io/repos/github/djps/pyWave3D/badge.svg?branch=main)](https://coveralls.io/github/djps/pyWave3D?branch=main)
+[![made-with-python](https://img.shields.io/badge/Made%20with-Python-1f425f.svg)](https://www.python.org/)
+[![License](https://img.shields.io/badge/license-MIT-yellow.svg)](./LICENSE.md)
+
 
 Pseudo-spectral spatial-marching scheme for nonlinear ultrasound from holography data.
 
