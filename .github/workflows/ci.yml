@@ -31,4 +31,8 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: pip install -e ".[test]"
       # beartype is on unless PYWAVE3D_NO_BEARTYPE is set; tests/test_beartype.py fails if it is off
-      - run: pytest
+      - run: pytest --cov=pywave3d --cov-report=lcov
+      - uses: coverallsapp/github-action@v2
+        if: matrix.python == '3.12'   # upload once, not once per matrix entry
+        with:
+          file: coverage.lcov
