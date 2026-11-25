@@ -1,0 +1,8 @@
+# Files for the source distribution beyond the package itself, so that the tests and examples run from it
+graft tests
+graft docs
+graft examples
+graft options
+graft data
+include .pre-commit-config.yaml
+global-exclude __pycache__ *.py[cod]
