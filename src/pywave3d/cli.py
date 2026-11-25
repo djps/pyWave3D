@@ -1,0 +1,59 @@
+"""Command line: ``pywave3d [nthreads] [options.json] [-o DIR] [-q | -v]``.
+
+Without an options file the built-in default runs: a 50 W, 1 MHz focused transducer
+(radius 12.5 mm, focus 50 mm) in water, with nonlinearity and thermoviscous absorption.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+from pathlib import Path
+
+from pywave3d.options import Options
+from pywave3d.solver import simulate
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Return the argument parser."""
+    p = argparse.ArgumentParser(prog="pywave3d", description=__doc__.splitlines()[0])
+    p.add_argument("nthreads", type=int, nargs="?", default=1, help="threads for the FFTs (default 1)")
+    p.add_argument(
+        "options", type=Path, nargs="?", default=None, help="JSON options file (default: built-in water example)"
+    )
+    p.add_argument("-o", "--output", type=Path, default=Path("."), help="directory for the output files (default: .)")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("-q", "--quiet", action="store_true", help="warnings and errors only")
+    g.add_argument("-v", "--verbose", action="store_true", help="debug output")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the simulation; return the exit status."""
+    args = build_parser().parse_args(argv)
+    level = logging.WARNING if args.quiet else logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(level=level, format="%(message)s", stream=sys.stdout)
+    try:
+        opts = Options.load(args.options) if args.options is not None else Options({})
+        results = simulate(opts, workers=max(1, args.nthreads))
+    except (OSError, TypeError, ValueError) as err:
+        print(f"pywave3d: error: {err}", file=sys.stderr)
+        return 1
+    met = opts.child("Solver.Metrics")
+    files = results.save(args.output, harmonics=met.get("harmonics", int, 4))
+    m = results.metrics()
+    logging.getLogger("pywave3d").info(
+        "Focus at z = %.4e m: p+ = %.4e Pa, p- = %.4e Pa; wrote %s",
+        m["focus"]["z"],
+        m["focus"]["p_positive"],
+        m["focus"]["p_negative"],
+        ", ".join(f.name for f in files),
+    )
+    logging.getLogger("pywave3d").debug("%s", json.dumps(m, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

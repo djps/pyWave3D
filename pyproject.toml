@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pywave3d"
+dynamic = ["version"]
+description = "Nonlinear ultrasound beams by a pseudo-spectral spatial-marching scheme"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "David Sinden" }]
+keywords = ["acoustics", "ultrasound", "HIFU", "nonlinear", "angular spectrum", "Westervelt", "KZK"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Intended Audience :: Science/Research",
+]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "beartype>=0.18",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+dev = ["pytest>=7", "ruff>=0.17", "mypy>=1.8", "pre-commit>=3"]
+
+[project.scripts]
+pywave3d = "pywave3d.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "pywave3d.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
+markers = ["slow: end-to-end runs that take more than a few seconds"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# ANN: every function in src/ must be annotated, since beartype only checks annotated code
+select = ["E", "F", "W", "I", "B", "UP", "NPY", "RUF", "ANN"]
+ignore = ["E741", "RUF002", "RUF003", "ANN401"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ANN"]
+"examples/**" = ["ANN"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["src/pywave3d"]
+ignore_missing_imports = true

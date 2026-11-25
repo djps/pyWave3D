@@ -1,0 +1,25 @@
+{
+  "Model": {
+    "Geometry": {"lx": 0.04, "ly": 0.04, "lz": 0.10, "origin": [0.0, 0.0, 0.0]},
+    "PhysicalProperties": {
+      "BaseFrequency": 1.0e6,
+      "SpeedofSound": 1482,
+      "Density": 998,
+      "NonlinearityCoefficient": 3.5,
+      "Diffusivity": 4.33e-6
+    },
+    "Transducer": {"outer_radius": 0.0125, "inner_radius": 0.0, "focusing_depth": 0.05, "frequency": 1.0e6, "power": 50}
+  },
+  "Solver": {
+    "Options": {"Diff": true, "NLN": true, "Adsorp": true, "AbsorbingBC": false},
+    "DiffractSolver": {"NumberOfPointsPerWaveLength": 6, "SamplingFrequencyMultiplier": 32},
+    "NonlinearSolver": {"method": "auto", "switch_threshold": 1e-3, "amplitude_threshold": 1e-4},
+    "Metrics": {"focal_quantity": "p_positive", "harmonics": 4, "levels_dB": [-6, -3, -12, -20],
+                "hydrophone_diameter": 0.0, "derating": 0.3, "face_distance": 0.003},
+    "Output": {
+      "every": 1,
+      "plane_peaks": true,
+      "xyz": [{"name": "p_focus.txt", "position": [0.02, 0.02, 0.05]}]
+    }
+  }
+}

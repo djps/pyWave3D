@@ -1,0 +1,79 @@
+{
+  "Model": {
+    "Geometry": {
+      "lx": 0.01,
+      "ly": 0.01,
+      "lz": 0.02,
+      "origin": [0.0, 0.0, 0.0]
+    },
+    "PhysicalProperties": {
+      "BaseFrequency": 1000000,
+      "Diffusivity": 1.5e-06,
+      "NonlinearityCoefficient": 3.5,
+      "Density": 1000,
+      "SpeedofSound": 1487
+    },
+    "Transducer": {
+      "outer_radius": 0.025,
+      "inner_radius": 0,
+      "focusing_depth": 0.08,
+      "frequency": 1000000.0,
+      "power": 100
+    },
+    "Initial": {
+      "InputFile": "pxy_at_z0.txt"
+    }
+  },
+  "Solver": {
+    "Options": {
+      "Diff": true,
+      "NLN": false,
+      "Adsorp": true,
+      "AbsorbingBC": false
+    },
+    "Diff": "DiffractSolver",
+    "NLN": "NonlinearSolver",
+    "Absorp": "AdsorptionSolver",
+    "DiffractSolver": {
+      "NumberOfPointsPerWaveLength": 8,
+      "SamplingFrequencyMultiplier": 8
+    },
+    "Metrics": {
+      "enabled": true,
+      "file": "metrics.json",
+      "axial_file": "axial.txt",
+      "harmonics": 4,
+      "levels_dB": [-6],
+      "focal_quantity": "p_positive",
+      "sections": false
+    },
+    "Output": {
+      "xyz": [
+        {
+          "name": "p0.txt",
+          "position": [0.005, 0.005, 0.0]
+        },
+        {
+          "name": "p01.txt",
+          "position": [0.005, 0.005, 0.05]
+        },
+        {
+          "name": "p02.txt",
+          "position": [0.004, 0.004, 0.05]
+        },
+        {
+          "name": "p1.txt",
+          "position": [0.005, 0.005, 0.1]
+        },
+        {
+          "name": "p2.txt",
+          "position": [0.005, 0.005, 0.5]
+        },
+        {
+          "name": "p4.txt",
+          "position": [0.005, 0.005, 1.0]
+        }
+      ]
+    }
+  }
+}
