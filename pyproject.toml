@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "pywave3d"
@@ -13,6 +13,7 @@ authors = [{ name = "David Sinden" }]
 keywords = ["acoustics", "ultrasound", "HIFU", "nonlinear", "angular spectrum", "Westervelt", "KZK"]
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
     "Topic :: Scientific/Engineering :: Physics",
     "Intended Audience :: Science/Research",
 ]
@@ -29,11 +30,27 @@ dev = ["pytest>=7", "ruff>=0.17", "mypy>=1.8", "pre-commit>=3"]
 [project.scripts]
 pywave3d = "pywave3d.cli:main"
 
-[tool.setuptools.dynamic]
-version = { attr = "pywave3d.__version__" }
+[tool.hatch.version]
+path = "src/pywave3d/__init__.py"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.hatch.metadata]
+
+# can be removed as soon as uff is published and no longer a direct reference
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pywave3d"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "/.github",
+    "/docs",
+    "/examples",
+    "/tests",
+    "/data",
+    "/options",
+]
+
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
