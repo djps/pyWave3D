@@ -11,46 +11,52 @@ By default, pyWave3D models **nonlinear propagation in water with thermoviscous 
 The pressure on each plane $z = \text{const}$ is stored as the complex values of its harmonics in the retarded time $\tau = t - z/c_0$:
 
 ```math
-p(x, y, z, \tau) = \operatorname{Re} \sum_{n=1}^{K} P_n(x, y, z) \, e^{+i n \omega \tau} .
+p(x, y, z, \tau) = \mathfrak{Re} \sum_{n=1}^{K} P_n(x, y, z) \, e^{+i n \omega \tau} .
 ```
 
 From the real and the imaginary parts, the phase and the amplitude can be computed.
 
-The field is marched from the source plane along $z$ by second-order (Strang) operator splitting of the one-way Westervelt equation. This is the approach of the Moscow State University HIFU simulators (Yuldashev and Khokhlova, *Acoust. Phys.* 57, 2011; Yuldashev et al., *IEEE TUFFC* 68, 2021). Each step of length $\Delta z$ is $L(\Delta z/2) \, N(\Delta z) \, L(\Delta z/2)$:
+The field is marched from the source plane along $z$ by second-order (Strang) operator splitting of the one-way Westervelt equation. This is the approach of the Moscow State University HIFU simulators (Yuldashev and Khokhlova, *Acoust. Phys.* 57, 2011; Yuldashev et al., *IEEE TUFFC* 68, 2021). Each step of length $\Delta z$ is $L(\Delta z/2) \, N(\Delta z) \, L(\Delta z/2)$.
 
-- **L**, linear (`pywave3d.linear`): diffraction, absorption and dispersion together, applied exactly for each harmonic in the angular spectrum domain. Each plane-wave component $(k_x, k_y)$ of harmonic $n$ is multiplied by
+### Linear step $L$
 
-  ```math
-  \exp\!\left[ -i \left( k_{z,n} - k_n \right) \Delta z - \left( \alpha_n + i \, \Delta k_n \right) \Delta z \right], \qquad k_{z,n} = \sqrt{k_n^2 - k_x^2 - k_y^2} .
-  ```
+The linear step (`pywave3d.linear`) applies diffraction, absorption and dispersion together, exactly, for each harmonic in the angular spectrum domain. Each plane-wave component $(k_x, k_y)$ of harmonic $n$ is multiplied by
 
-  Evanescent components decay. With `"Type": "parabolic"` the KZK (paraxial) operator is used instead.
-- **N**, nonlinear (`pywave3d.nonlinear`):
+```math
+\exp\!\left[ -i \left( k_{z,n} - k_n \right) \Delta z - \left( \alpha_n + i \, \Delta k_n \right) \Delta z \right], \qquad k_{z,n} = \sqrt{k_n^2 - k_x^2 - k_y^2} .
+```
 
-  ```math
-  \frac{\partial p}{\partial z} = \frac{\beta}{\rho_0 c_0^3} \, p \, \frac{\partial p}{\partial \tau}
-  ```
+Evanescent components decay. With `"Type": "parabolic"` the KZK (paraxial) operator is used instead.
 
-  at each transverse point, integrated in one of two ways:
-  - in the frequency domain while the spectrum is narrow: 4th-order Runge–Kutta, with the quadratic term evaluated pseudo-spectrally and free of aliasing (3/2 rule);
-  - in the time domain once shocks form: a conservative MUSCL–Godunov scheme that captures the shocks; truncating to $K$ harmonics then removes the energy a shock dissipates.
+### Nonlinear step $N$
 
-  `"method": "auto"` (the default) switches from the first to the second once the $K$-th harmonic exceeds `switch_threshold` ($10^{-3}$) times the fundamental.
+The nonlinear step (`pywave3d.nonlinear`) integrates
 
-Absorption laws:
+```math
+\frac{\partial p}{\partial z} = \frac{\beta}{\rho_0 c_0^3} \, p \, \frac{\partial p}{\partial \tau}
+```
 
-- `thermoviscous` (the default): $\alpha = \delta \omega^2 / (2 c_0^3)$, from the sound diffusivity $\delta$ (water: $4.33 \times 10^{-6}$ m²/s, giving 0.026 Np/m at 1 MHz).
-- `power_law`: $\alpha_n = \alpha_0 n^y$, optionally with the Kramers–Kronig dispersion that the power law requires.
+at each transverse point, in one of two ways. While the spectrum is narrow, it is integrated in the frequency domain by 4th-order Runge–Kutta, with the quadratic term evaluated pseudo-spectrally and free of aliasing (3/2 rule). Once shocks form, it is integrated in the time domain by a conservative MUSCL–Godunov scheme that captures the shocks; truncating to $K$ harmonics then removes the energy a shock dissipates.
 
-What makes it fast:
+`"method": "auto"` (the default) switches from the first to the second once the $K$-th harmonic exceeds `switch_threshold` ($10^{-3}$) times the fundamental.
 
-- $n_x$ and $n_y$ are rounded up to FFT-friendly sizes;
-- only the harmonics that hold energy are transformed;
-- the two linear half-steps between unrecorded planes are merged into one (exact without an absorbing layer; a layer does not commute with diffraction, so with one, `Output.every` changes results at the $10^{-3}$ level);
-- points below $10^{-4}$ of the plane maximum skip the nonlinear step;
-- the nonlinear step works on cache-sized chunks of points on a thread pool;
-- the FFTs are multithreaded (`scipy.fft`, `workers`);
-- plane peaks are computed only at points where the bound $\sum_n \lvert P_n \rvert$ can beat the values already known.
+### Absorption
+
+`thermoviscous` (the default) gives $\alpha = \delta \omega^2 / (2 c_0^3)$, from the sound diffusivity $\delta$. For water $\delta = 4.33 \times 10^{-6}$ m²/s, giving 0.026 Np/m at 1 MHz.
+
+`power_law` gives $\alpha_n = \alpha_0 n^y$, optionally with the Kramers–Kronig dispersion that the power law requires.
+
+### Performance
+
+The transverse sizes $n_x$ and $n_y$ are rounded up to FFT-friendly sizes, and only the harmonics that hold energy are transformed. The FFTs are multithreaded (`scipy.fft`, `workers`).
+
+The two linear half-steps between unrecorded planes are merged into one. This is exact without an absorbing layer; a layer does not commute with diffraction, so with one, `Output.every` changes results at the $10^{-3}$ level.
+
+Points below $10^{-4}$ of the plane maximum skip the nonlinear step, and the nonlinear step works on cache-sized chunks of points on a thread pool.
+
+Plane peaks are computed only at points where the bound $\sum_n \lvert P_n \rvert$ can beat the values already known.
+
+### Defaults
 
 The defaults are water at 20 °C ($c_0 = 1482$ m/s, $\rho_0 = 998$ kg/m³, $\beta = 3.5$, $\delta = 4.33 \times 10^{-6}$ m²/s) and a 1 MHz, 50 W focused piston (radius 12.5 mm, focus 50 mm), on a 40 × 40 × 100 mm domain with 6 points per wavelength and 16 harmonics.
 
@@ -137,16 +143,20 @@ The run writes these files to the output directory:
 
 The focal quantity is set by `Solver.Metrics.focal_quantity`: `p_positive` (the default), `p_negative` or `first_harmonic`.
 
+### IEC field parameters
+
 [docs/iec_outputs.md](docs/iec_outputs.md) lists the field parameters that the IEC standards ask for (IEC 62127-1, 61828, TS 62556, 62555, 62359, 61689). For each, it says how to compute it in this scheme and where pyWave3D records it. pyWave3D records all of them in every run (`pywave3d.iec`, the `iec` section of `metrics.json`):
 
-- the acoustic working frequency;
-- $p_c$ and $p_r$, and hydrophone-averaged values;
-- $I_{\mathrm{ta}}$ (plane-wave and exact), $I_{\mathrm{spta}}$, $I_{\mathrm{sppa}}$, ppsi and pii;
-- power: plane-wave and exact, and through the focal area;
-- the beam-alignment axis, focal widths, depths and areas at every level, and side lobes;
-- derated MI and the thermal indices TIS, TIB and TIC;
-- $A_{\mathrm{BCS}}$, $A_{\mathrm{ER}}$, the effective intensity and $R_{\mathrm{BN}}$;
-- steepness and shock parameters.
+| group | parameters |
+| --- | --- |
+| frequency | the acoustic working frequency |
+| pressure | $p_c$ and $p_r$, and hydrophone-averaged values |
+| intensity | $I_{\mathrm{ta}}$ (plane-wave and exact), $I_{\mathrm{spta}}$, $I_{\mathrm{sppa}}$, ppsi and pii |
+| power | plane-wave and exact, and through the focal area |
+| beam geometry | the beam-alignment axis, focal widths, depths and areas at every level, and side lobes |
+| safety indices | derated MI and the thermal indices TIS, TIB and TIC |
+| areas | $A_{\mathrm{BCS}}$, $A_{\mathrm{ER}}$, the effective intensity and $R_{\mathrm{BN}}$ |
+| nonlinearity | steepness and shock parameters |
 
 The exceptions are pulse duration and the scanned-mode indices, which a single periodic beam cannot represent. A test checks that every key the document names is produced.
 
@@ -173,18 +183,35 @@ The reference file `options/woptions.json` sets `"NLN": false`, so it runs linea
 
 ## Conventions
 
-- Phases follow $p = \operatorname{Re} \sum_n P_n e^{+i n \omega t}$. A source converging on $z = d$ has the phase $e^{+i k \left( \sqrt{r^2 + d^2} - d \right)}$.
-- The grid includes both ends of the domain, so $\Delta x = l_x / (n_x - 1)$. $n_x$ and $n_y$ are even (and FFT-friendly unless `FastFFTSizes` is false, or they are given explicitly), and the beam axis is the grid point $(n_x/2, n_y/2)$.
-- The angular spectrum method treats the transverse plane as periodic. Keep the field well inside the domain, or enable an absorbing layer:
-  - `sponge` multiplies every component by $e^{-\sigma \Delta z}$ per step, whatever its direction;
-  - `pml` is a perfectly matched layer, the complex coordinate stretch $\partial_x \to \left( 1 - i \sigma / k_n \right)^{-1} \partial_x$. A plane wave $(k_x, k_y)$ decays per unit $z$ by
+### Phase
 
-    ```math
-    \frac{\sigma_x k_x^2}{k_n k_z} + \frac{\sigma_y k_y^2}{k_n k_z} ,
-    ```
+Phases follow $p = \mathfrak{Re} \sum_n P_n e^{+i n \omega t}$. A source converging on $z = d$ has the phase $e^{+i k \left( \sqrt{r^2 + d^2} - d \right)}$.
 
-    so waves leaving through the side are absorbed and waves running along $z$ next to the edge are left alone. $\sigma$ varies in $x$ and $y$ while the decay depends on $(k_x, k_y)$, so the symbol is applied at `levels` values of $\sigma$ and interpolated pointwise (phase shift plus interpolation). Each level costs one inverse FFT per direction and harmonic. The PML needs diffraction on.
-  - On a Gaussian beam leaving the side at 25°, compared with a domain 5× wider, the PML leaves 0.43× the sponge's error. Along $z$ next to the edge it leaves 0.05× the sponge's error, because the sponge eats into the beam. At 45–60° the two are alike.
+### Grid
+
+The grid includes both ends of the domain, so $\Delta x = l_x / (n_x - 1)$. The sizes $n_x$ and $n_y$ are even (and FFT-friendly unless `FastFFTSizes` is false, or they are given explicitly), and the beam axis is the grid point $(n_x/2, n_y/2)$.
+
+### Absorbing layers
+
+The angular spectrum method treats the transverse plane as periodic. Keep the field well inside the domain, or enable an absorbing layer.
+
+#### Sponge
+
+`sponge` multiplies every component by $e^{-\sigma \Delta z}$ per step, whatever its direction.
+
+#### Perfectly matched layer
+
+`pml` is a perfectly matched layer, the complex coordinate stretch $\partial_x \to \left( 1 - i \sigma / k_n \right)^{-1} \partial_x$. A plane wave $(k_x, k_y)$ decays per unit $z$ by
+
+```math
+\frac{\sigma_x k_x^2}{k_n k_z} + \frac{\sigma_y k_y^2}{k_n k_z} ,
+```
+
+so waves leaving through the side are absorbed and waves running along $z$ next to the edge are left alone. Since $\sigma$ varies in $x$ and $y$ while the decay depends on $(k_x, k_y)$, the symbol is applied at `levels` values of $\sigma$ and interpolated pointwise (phase shift plus interpolation). Each level costs one inverse FFT per direction and harmonic. The PML needs diffraction on.
+
+#### Comparison
+
+On a Gaussian beam leaving the side at 25°, compared with a domain 5× wider, the PML leaves 0.43× the sponge's error. Along $z$ next to the edge it leaves 0.05× the sponge's error, because the sponge eats into the beam. At 45–60° the two are alike.
 
 ## Type checking
 
@@ -209,25 +236,41 @@ pytest                      # about 5 s
 pytest tests/test_kwave.py  # needs k-wave-python
 ```
 
-- `test_linear.py` checks one step against its closed form: the phase of a transverse mode, evanescent decay, absorption, the paraxial operator, half steps, the sponge, and the PML: a plane wave untouched, the decay of a transverse mode at the edge (exact and paraxial), and wrap-around of a tilted and an edge-hugging beam against a 5× wider domain.
-- `test_nonlinear.py` checks the nonlinear step against the exact plane-wave solutions: Fubini before the shock (both integrators), and the sawtooth decay $2 p_0 / \left( n (1 + \sigma) \right)$ after it (Godunov). It also checks energy conservation, second-harmonic growth, the automatic switch, and that results do not depend on the number of threads.
-- `test_solver.py` runs end to end:
-  - the linear focused field on the axis against the Rayleigh–Sommerfeld integral (within 2%);
-  - identification of the focus and of the focal plane;
-  - power conservation;
-  - merged steps giving the same field;
-  - nonlinear trends with amplitude, single precision, the reference options file, and the CLI.
-- `test_kwave.py` compares the linear field with k-Wave's continuous-wave angular spectrum solver (`kwave.utils.angular_spectrum_cw`):
-  - the same periodic problem must agree to round-off;
-  - with k-Wave's zero-padding and angular restriction on a wide domain, the axis and the focal plane agree to 2% of the peak. The difference is pyWave3D's periodic images: 1.3% at 40 mm, 0.9% at 60 mm.
-  - pyWave3D is at least as close to the Rayleigh–Sommerfeld integral as k-Wave; both are about 1.3% off, because of the band-limited, hard-edged source.
-  - with absorption, the two agree to 1.5%.
-  - a time-domain k-Wave run (pure-Python backend, a 3.5 mm piston on a 40 × 24 × 24 grid, about 12 s), reduced by `preprocess.time_domain.from_kwave`: its first plane marched by pyWave3D, zero-padded against periodic images, agrees with k-Wave's own axis to 4% of the peak.
+### `test_linear.py`
 
-  It is skipped if `kwave` is not installed. The first import of `kwave` downloads its binaries (about 200 MB).
-- `test_iec.py` checks the IEC functions against analytic cases: the sinc side lobe at −13.26 dB, Parseval pulse integrals, the $\cos\theta$ obliquity of the exact intensity, zero intensity for evanescent waves, disc averaging, a recovered tilted axis, sawtooth shock parameters, and the MI and TI formulae. It also checks a full run, and that every key named in `docs/iec_outputs.md` is produced.
-- `test_preprocess.py` records every plane of a nonlinear run and gives the planes back to each preprocessor: as harmonics (also in another axis order, with absolute phase and $e^{-i \omega t}$, and as a 2D single-harmonic field), and as time series in the k-wave-python and fullwave25 formats, sampled at a time step that does not divide the period, after a transient, with drift for FDTD. Each must give back the metrics of the planes (to $10^{-12}$ for harmonics, $10^{-8}$ for time series). It also checks the harmonic fit, the warning for a non-steady record and the input errors.
-- `test_options.py`, `test_model.py` and `test_medium_grid.py` cover the options rules, the input files, the transducer, and the medium and grid.
+Checks one step against its closed form: the phase of a transverse mode, evanescent decay, absorption, the paraxial operator, half steps, the sponge, and the PML: a plane wave untouched, the decay of a transverse mode at the edge (exact and paraxial), and wrap-around of a tilted and an edge-hugging beam against a 5× wider domain.
+
+### `test_nonlinear.py`
+
+Checks the nonlinear step against the exact plane-wave solutions: Fubini before the shock (both integrators), and the sawtooth decay $2 p_0 / \left( n (1 + \sigma) \right)$ after it (Godunov). It also checks energy conservation, second-harmonic growth, the automatic switch, and that results do not depend on the number of threads.
+
+### `test_solver.py`
+
+Runs end to end: the linear focused field on the axis against the Rayleigh–Sommerfeld integral (within 2%); identification of the focus and of the focal plane; power conservation; merged steps giving the same field; and nonlinear trends with amplitude, single precision, the reference options file, and the CLI.
+
+### `test_kwave.py`
+
+Compares the linear field with k-Wave's continuous-wave angular spectrum solver (`kwave.utils.angular_spectrum_cw`). The same periodic problem must agree to round-off. With k-Wave's zero-padding and angular restriction on a wide domain, the axis and the focal plane agree to 2% of the peak; the difference is pyWave3D's periodic images: 1.3% at 40 mm, 0.9% at 60 mm. pyWave3D is at least as close to the Rayleigh–Sommerfeld integral as k-Wave; both are about 1.3% off, because of the band-limited, hard-edged source. With absorption, the two agree to 1.5%.
+
+It also runs a time-domain k-Wave case (pure-Python backend, a 3.5 mm piston on a 40 × 24 × 24 grid, about 12 s), reduced by `preprocess.time_domain.from_kwave`: its first plane marched by pyWave3D, zero-padded against periodic images, agrees with k-Wave's own axis to 4% of the peak.
+
+It is skipped if `kwave` is not installed. The first import of `kwave` downloads its binaries (about 200 MB).
+
+### `test_iec.py`
+
+Checks the IEC functions against analytic cases: the sinc side lobe at −13.26 dB, Parseval pulse integrals, the $\cos\theta$ obliquity of the exact intensity, zero intensity for evanescent waves, disc averaging, a recovered tilted axis, sawtooth shock parameters, and the MI and TI formulae. It also checks a full run, and that every key named in `docs/iec_outputs.md` is produced.
+
+### `test_preprocess.py`
+
+Records every plane of a nonlinear run and gives the planes back to each preprocessor: as harmonics (also in another axis order, with absolute phase and $e^{-i \omega t}$, and as a 2D single-harmonic field), and as time series in the k-wave-python and fullwave25 formats, sampled at a time step that does not divide the period, after a transient, with drift for FDTD. Each must give back the metrics of the planes (to $10^{-12}$ for harmonics, $10^{-8}$ for time series). It also checks the harmonic fit, the warning for a non-steady record and the input errors.
+
+### `test_beartype.py`
+
+Checks that beartype is on and wraps every annotated function in the package, and that it rejects an argument of the wrong type.
+
+### Other tests
+
+`test_options.py`, `test_model.py` and `test_medium_grid.py` cover the options rules, the input files, the transducer, and the medium and grid. `test_examples.py` checks that the example options file is valid and that the quick example runs work.
 
 ## Layout
 
