@@ -32,10 +32,10 @@ if not os.environ.get("PYWAVE3D_NO_BEARTYPE"):
     beartype_this_package(conf=BeartypeConf(is_pep484_tower=True))
 
 from pywave3d.grid import Grid
-from pywave3d.linear import AbsorbingLayer, LinearPropagator
+from pywave3d.linear import AbsorbingLayer, AxialSmoothing, LinearPropagator
 from pywave3d.medium import Attenuation, Medium
 from pywave3d.model import Source, Transducer, WaveModel
-from pywave3d.nonlinear import NonlinearOperator
+from pywave3d.nonlinear import AdaptiveSmoothing, NonlinearOperator
 from pywave3d.options import Options, load_options
 from pywave3d.recorder import PlaneRecorder, RecordSettings
 from pywave3d.results import Results
@@ -45,7 +45,9 @@ __version__ = "0.2.0"
 
 __all__ = [
     "AbsorbingLayer",
+    "AdaptiveSmoothing",
     "Attenuation",
+    "AxialSmoothing",
     "Grid",
     "LinearPropagator",
     "Medium",

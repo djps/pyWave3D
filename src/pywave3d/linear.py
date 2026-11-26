@@ -32,6 +32,7 @@ Sguazzero 1984). Each level is a contraction and the weights are convex, so the 
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -115,6 +116,94 @@ class AbsorbingLayer:
         return np.maximum(sig[0][:, None], sig[1][None, :])
 
 
+def _logcosh(x: float) -> float:
+    """log(cosh(x)), without overflow."""
+    a = abs(x)
+    return a + math.log1p(math.exp(-2 * a)) - math.log(2.0)
+
+
+@dataclass(frozen=True, slots=True)
+class AxialSmoothing:
+    """Artificial absorption around the focus against the oscillations that shocks cause.
+
+    Yuldashev and Khokhlova (*Acoust. Phys.* 57, 2011, eq. 11) multiply the absorption of
+    water by an axial profile that rises to ``A`` around the focus and falls to ``B`` after it:
+
+        m(z) = a1 + (A - 1)/2 [tanh((z - z1)/dz1) - a2 tanh((z - z2)/dz2)],
+        a1 = (1 + B)/2,  a2 = 1 + (1 - B)/(A - 1),
+
+    so m = 1 before z1, A between z1 and z2 and B after z2. (The manuscript prints
+    a2 = 1 + (1 - B)(A - 1), which does not give these limits.) It is evaluated here in the
+    equivalent form, which is also defined at A = 1,
+
+        m(z) = 1 + (A - 1) s((z - z1)/dz1) - (A - B) s((z - z2)/dz2),  s(x) = (1 + tanh x)/2.
+
+    The multiplier scales the thermoviscous part of the absorption: the diffusivity delta
+    becomes m(z) delta, as in the adaptive scheme of Maxwell et al. (*IEEE TUFFC* 64, 2017),
+    so each harmonic n gains the extra absorption (m - 1) delta omega_n^2 / (2 c0^3). Over a
+    step the profile is integrated exactly, so steps longer than the transition widths are
+    handled correctly. z is measured from the source plane.
+
+    The defaults of the geometry are those of the paper: z1 = 0.96 F, z2 = 1.03 F and
+    dz1 = dz2 = 0.01 F. The paper chose A for each source level (2.5, 5, 20 and 40 as the
+    source intensity rose from 2 to 10 W/cm^2, about 7 points per shock) and gives no value for
+    B, so the defaults A = 5 and B = 1 (back to the physical absorption after the focus) are
+    starting points to adjust, not values from the paper.
+
+    Attributes:
+        focal_length: F [m], the distance from the source plane to the focus; 0 takes the
+            transducer's focusing depth (see :class:`pywave3d.WaveSolver`).
+        peak_multiplier: A, the multiplier between z1 and z2.
+        post_focal_multiplier: B, the multiplier after z2.
+        start, end: z1 / F and z2 / F.
+        start_width, end_width: dz1 / F and dz2 / F, the widths of the transitions.
+    """
+
+    focal_length: float = 0.0
+    peak_multiplier: float = 5.0
+    post_focal_multiplier: float = 1.0
+    start: float = 0.96
+    end: float = 1.03
+    start_width: float = 0.01
+    end_width: float = 0.01
+
+    def __post_init__(self) -> None:
+        if self.focal_length < 0:
+            raise ValueError("shock smoothing: focal_length must be >= 0")
+        if self.peak_multiplier < 0 or self.post_focal_multiplier < 0:
+            raise ValueError("shock smoothing: the multipliers must be >= 0")
+        if self.start_width <= 0 or self.end_width <= 0:
+            raise ValueError("shock smoothing: the transition widths must be positive")
+        if self.start >= self.end:
+            raise ValueError("shock smoothing: start must be before end")
+
+    def _steps(self) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+        """(height, centre [m], width [m]) of the rising and the falling step."""
+        f = self.focal_length
+        if f <= 0:
+            raise ValueError("shock smoothing: the focal length is not set")
+        a, b = self.peak_multiplier, self.post_focal_multiplier
+        return (a - 1, self.start * f, self.start_width * f), (b - a, self.end * f, self.end_width * f)
+
+    def multiplier(self, z: RealArray | float) -> RealArray:
+        """m(z) at distances ``z`` from the source plane [m]."""
+        z = np.asarray(z, dtype=float)
+        m = np.ones_like(z)
+        for height, centre, width in self._steps():
+            m = m + height * 0.5 * (1 + np.tanh((z - centre) / width))
+        return np.asarray(m)
+
+    def excess(self, za: float, zb: float) -> float:
+        """The integral of m(z) - 1 from ``za`` to ``zb`` [m] (distances from the source plane)."""
+        total = 0.0
+        for height, centre, width in self._steps():
+            # integral of s((z - c)/w) = (z - c)/2 + (w/2) log cosh((z - c)/w)
+            ia = (za - centre) / 2 + width / 2 * _logcosh((za - centre) / width)
+            ib = (zb - centre) / 2 + width / 2 * _logcosh((zb - centre) / width)
+            total += height * (ib - ia)
+        return total
+
+
 class _PML:
     """The PML symbol at reference levels of sigma, for one step fraction.
 
@@ -159,6 +248,9 @@ class LinearPropagator:
             without it nothing moves sideways and the layer does nothing.
         dtype: complex dtype of the field.
         workers: threads for the FFTs.
+        smoothing: optional artificial absorption around the focus (:class:`AxialSmoothing`,
+            with its focal length set). It is applied whether or not ``absorption`` is on, and
+            needs the position of each step: see :meth:`apply`.
     """
 
     def __init__(
@@ -173,12 +265,19 @@ class LinearPropagator:
         layer: AbsorbingLayer | None = None,
         dtype: type[np.complexfloating] = np.complex128,
         workers: int = 1,
+        smoothing: AxialSmoothing | None = None,
     ) -> None:
         self.grid = grid
         self.diffraction = diffraction
         self.workers = workers
         n = np.arange(1, grid.n_harmonics + 1, dtype=float)
         kn = 2 * np.pi * frequency * n / medium.sound_speed  # (K,)
+        if smoothing is not None:
+            smoothing._steps()  # check that the focal length is set
+        self.smoothing = smoothing
+        # thermoviscous absorption per unit multiplier: delta omega_n^2 / (2 c0^3) [Np/m]
+        omega = 2 * np.pi * frequency * n
+        self._viscous = medium.diffusivity * omega**2 / (2 * medium.sound_speed**3)
 
         loss = np.zeros_like(n, dtype=complex)
         if absorption:
@@ -228,7 +327,9 @@ class LinearPropagator:
                 self._layer_full = np.exp(-sponge * grid.dz).astype(real)
                 self._layer_half = np.exp(-sponge * grid.dz / 2).astype(real)
 
-    def apply(self, field: ComplexArray, fraction: float = 1.0, n_active: int | None = None) -> None:
+    def apply(
+        self, field: ComplexArray, fraction: float = 1.0, n_active: int | None = None, z: float | None = None
+    ) -> None:
         """Advance ``field`` (shape (K, nx, ny)) in place by ``fraction`` x dz.
 
         Args:
@@ -236,6 +337,8 @@ class LinearPropagator:
             fraction: 1.0 for a full step, 0.5 for half a step.
             n_active: only the first ``n_active`` harmonics are transformed (the others must be
                 zero); None for all.
+            z: where the step starts [m, grid coordinate]; needed with shock smoothing, which
+                is integrated from z to z + fraction dz.
         """
         if fraction == 1.0:
             op, layer, pml = self._full, self._layer_full, self._pml_full
@@ -257,6 +360,13 @@ class LinearPropagator:
             sub *= op[:na]
         if layer is not None:
             sub *= layer
+        if self.smoothing is not None:
+            if z is None:
+                raise ValueError("shock smoothing needs the position z of the step")
+            za = z - self.grid.z0
+            excess = self.smoothing.excess(za, za + fraction * self.grid.dz)
+            if excess != 0.0:
+                sub *= np.exp(-self._viscous[:na] * excess).astype(sub.real.dtype)[:, None, None]
 
     def _apply_pml(self, sub: ComplexArray, spec: ComplexArray, pml: _PML, na: int) -> None:
         """Damp ``sub`` (already propagated; ``spec`` is its spectrum) in the PML, x then y."""

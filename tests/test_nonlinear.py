@@ -134,3 +134,67 @@ def test_small_amplitudes_are_skipped(water: pw.Medium) -> None:
     NonlinearOperator(water, F0, 8, amplitude_threshold=1e-4).apply(f, 1e-2)
     np.testing.assert_array_equal(f[:, 1], before)
     assert abs(f[1, 0, 0]) > 0
+
+
+def rise_time(harmonics: np.ndarray, period: float, nt: int = 4096) -> tuple[float, float]:
+    """(10-90 % rise time [s], jump [Pa]) of the steepest front of a waveform."""
+    from pywave3d.nonlinear import waveform
+
+    u = waveform(harmonics.reshape(-1, 1), nt)[:, 0]
+    i = int(np.argmax(np.roll(u, -1) - u))
+    u = np.roll(u, nt // 2 - i)
+    c, w = nt // 2, nt // 4
+    lo, hi = u[c - w : c].min(), u[c : c + w].max()
+    jump = hi - lo
+    # the crossings of the 10 % and 90 % levels nearest the front
+    below = np.flatnonzero(u[:c] < lo + 0.1 * jump)
+    above = np.flatnonzero(u[c:] > lo + 0.9 * jump)
+    return (c + above[0] - below[-1]) * period / nt, jump
+
+
+def test_adaptive_smoothing_sets_the_taylor_diffusivity() -> None:
+    """A plane wave past its shock: the smoothing widens the shock to about tau_sh, with the
+    diffusivity of a Taylor shock of that rise time, and acts like that diffusivity would."""
+    water = pw.Medium.water()
+    f0, k, p0 = 1e6, 32, 1e6
+    xsh = water.shock_distance(f0, p0)
+    steps = 150
+    dz = 3 * xsh / steps
+    target = 7 / (2 * k * f0)
+
+    def run(medium: pw.Medium, smoothing: pw.AdaptiveSmoothing | None) -> tuple[np.ndarray, float]:
+        op = pw.NonlinearOperator(medium, f0, k, method="godunov", smoothing=smoothing)
+        alpha = medium.alpha(f0, np.arange(1.0, k + 1))[:, None, None]
+        p = np.zeros((k, 1, 1), dtype=complex)
+        p[0] = -1j * p0  # p = p0 sin(omega tau)
+        for _ in range(steps):
+            op.apply(p, dz)
+            p *= np.exp(-alpha * dz)
+        return p[:, 0, 0], op.last_artificial_diffusivity
+
+    plain, _ = run(water, None)
+    smoothed, delta_a = run(water, pw.AdaptiveSmoothing(rise_points=7))
+    rise, jump = rise_time(smoothed, 1 / f0)
+    assert rise_time(plain, 1 / f0)[0] < 0.3 * target  # Godunov alone keeps the shock sharp
+    assert 0.5 * target < rise < 1.5 * target
+    # the diffusivity is that of a Taylor shock of this jump and rise time
+    taylor = target * water.nonlinearity * jump / (4 * np.arctanh(0.8) * water.density)
+    assert delta_a + water.diffusivity == pytest.approx(taylor, rel=0.1)
+    # and the shock is as wide as in a medium with that diffusivity
+    viscous, _ = run(pw.Medium(diffusivity=delta_a + water.diffusivity), None)
+    assert rise == pytest.approx(rise_time(viscous, 1 / f0)[0], rel=0.2)
+
+
+def test_adaptive_smoothing_leaves_smooth_waveforms_alone() -> None:
+    water = pw.Medium.water()
+    op = pw.NonlinearOperator(water, 1e6, 32, method="godunov", smoothing=pw.AdaptiveSmoothing())
+    p = np.zeros((32, 2, 2), dtype=complex)
+    p[0] = 1e5
+    q = p.copy()
+    op.apply(q, 1e-3)
+    assert op.last_artificial_diffusivity == 0.0
+    plain = pw.NonlinearOperator(water, 1e6, 32, method="godunov")
+    plain.apply(p, 1e-3)
+    np.testing.assert_array_equal(p, q)
+    with pytest.raises(ValueError):
+        pw.AdaptiveSmoothing(rise_points=0)

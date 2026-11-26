@@ -30,12 +30,16 @@ as in the MSU HIFU codes (Yuldashev and Khokhlova 2011):
 
 Points where the pressure is below ``amplitude_threshold`` times the plane maximum are skipped:
 there the nonlinear change is of relative order (threshold)^2.
+
+With :class:`AdaptiveSmoothing`, the Godunov step also widens each shock to a set rise time
+by adding artificial diffusivity where the shock is (Maxwell et al., *IEEE TUFFC* 64, 2017).
 """
 
 from __future__ import annotations
 
 import math
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
@@ -45,6 +49,46 @@ from pywave3d._types import ComplexArray, RealArray
 from pywave3d.medium import Medium
 
 NonlinearMethod = Literal["auto", "spectral", "godunov"]
+
+#: 10-90 % rise time of the Taylor shock in units of rho0 delta / (beta dp): 4 artanh(0.8)
+TAYLOR_RISE = 4 * math.atanh(0.8)
+#: adaptive smoothing acts on fronts steeper than a Taylor front of rise GATE x tau_sh
+GATE = 1.5
+
+
+@dataclass(frozen=True, slots=True)
+class AdaptiveSmoothing:
+    """Artificial diffusivity that holds every shock at a set rise time.
+
+    Maxwell et al. (*IEEE TUFFC* 64, 2017, eq. 5) add to the diffusivity, at each transverse
+    point, the amount that makes the shock there a Taylor shock of rise time tau_sh. The steady
+    (Taylor) solution of the Burgers equation, dp/dz = epsilon p dp/dtau
+    + delta / (2 c0^3) d2p/dtau2, is a tanh front whose 10-90 % rise time is
+    4 artanh(0.8) rho0 delta / (beta dp_sh) for a jump dp_sh, so
+
+        delta + delta_a = tau_sh beta dp_sh / (4 artanh(0.8) rho0),   delta_a >= 0.
+
+    (Eq. 5 of the paper, written in normalised variables, has the same constant:
+    8.8 = 2 x 4 artanh(0.8).) The paper sets tau_sh to 7 steps of the time grid; here the time
+    grid is that of the harmonics kept, T / (2 K), with K the number of harmonics.
+
+    It acts in the Godunov step, where shocks are, and only at points whose front is steeper
+    than a Taylor front of rise time 1.5 tau_sh with the same jump, so smooth waveforms are left
+    alone (a sinusoid is, for at least 15 harmonics), while a front held at tau_sh stays
+    smoothed. On the waveform after the step: the front is at the steepest rise (max dp/dtau),
+    dp_sh is the rise from the minimum over the quarter period before it to the maximum over
+    the quarter period after it. delta_a is then applied to the harmonics over the step,
+    exp(-delta_a omega_n^2 dz / (2 c0^3)).
+
+    Attributes:
+        rise_points: tau_sh in steps T / (2 K) of the time grid.
+    """
+
+    rise_points: float = 7.0
+
+    def __post_init__(self) -> None:
+        if self.rise_points <= 0:
+            raise ValueError("adaptive smoothing: rise_points must be positive")
 
 
 def waveform(harmonics: ComplexArray, nt: int, workers: int = 1, axis: int = 0) -> RealArray:
@@ -87,6 +131,7 @@ class NonlinearOperator:
         rk_safety: the RK4 sub-step keeps dz epsilon omega K max|p| below this (< 2.8).
         workers: threads; the transverse points are shared between them.
         chunk_size: points per chunk of work.
+        smoothing: optional adaptive artificial diffusivity at the shocks (Godunov only).
     """
 
     def __init__(
@@ -103,6 +148,7 @@ class NonlinearOperator:
         rk_safety: float = 1.0,
         workers: int = 1,
         chunk_size: int = 4096,
+        smoothing: AdaptiveSmoothing | None = None,
     ) -> None:
         if method not in ("auto", "spectral", "godunov"):
             raise ValueError(f"nonlinear method must be 'auto', 'spectral' or 'godunov', not {method!r}")
@@ -127,6 +173,15 @@ class NonlinearOperator:
         self.last_substeps = 0
         self.chunk_size = chunk_size
         self._pool: ThreadPoolExecutor | None = None
+        self.smoothing = smoothing
+        self.diffusivity = medium.diffusivity
+        # shock rise time tau_sh [s] and delta per unit jump, tau_sh beta / (4 artanh(0.8) rho0)
+        self.rise_time = 0.0 if smoothing is None else smoothing.rise_points * self.period / (2 * n_harmonics)
+        self._delta_per_pa = self.rise_time * medium.nonlinearity / (TAYLOR_RISE * medium.density)
+        # absorption per unit diffusivity of each harmonic, omega_n^2 / (2 c0^3) [Np s/m^3]
+        self._viscous = (self.omega * n) ** 2 / (2 * medium.sound_speed**3)
+        #: largest artificial diffusivity of the last step [m^2/s] (0 without smoothing)
+        self.last_artificial_diffusivity = 0.0
 
     # -- public --------------------------------------------------------------------------
 
@@ -201,8 +256,11 @@ class NonlinearOperator:
             dtau = self.period / self.n_godunov
             nsub = max(1, math.ceil(self.epsilon * pmax * dz / (self.cfl * dtau)))
 
+            peaks: list[float] = []
+
             def run(chunk: ComplexArray) -> None:
-                chunk[...] = self._godunov(chunk, dz, nsub)
+                chunk[...], top = self._godunov(chunk, dz, nsub)
+                peaks.append(top)
 
         self.last_substeps = nsub
         size = self.chunk_size
@@ -214,6 +272,8 @@ class NonlinearOperator:
         else:
             for c in chunks:
                 run(c)
+        if method != "spectral":
+            self.last_artificial_diffusivity = max(peaks, default=0.0)
 
     @staticmethod
     def _rhs(p: ComplexArray, spec: ComplexArray, m: int, coef: ComplexArray) -> ComplexArray:
@@ -269,8 +329,32 @@ class NonlinearOperator:
         div *= 0.5 * self.epsilon / dtau
         return div
 
-    def _godunov(self, p: ComplexArray, dz: float, nsub: int) -> ComplexArray:
-        """MUSCL-Godunov with Heun steps over ``nsub`` sub-steps, on the waveform."""
+    def _artificial_diffusivity(self, u: RealArray, dtau: float) -> RealArray:
+        """delta_a [m^2/s] at each point (row) of waveforms ``u`` of shape (npts, nt)."""
+        npts, nt = u.shape
+        rows = np.arange(npts)[:, None]
+        rise = np.empty_like(u)
+        np.subtract(np.roll(u, -1, axis=-1), u, out=rise)  # u[j+1] - u[j]
+        steep = rise.argmax(axis=-1)
+        slope = rise[rows[:, 0], steep] / dtau  # max dp/dtau
+        # the waveform with its steepest rise in the middle
+        c = nt // 2
+        w = max(1, nt // 4)
+        centred = u[rows, (steep[:, None] + 1 - c + np.arange(nt)[None, :]) % nt]
+        jump = centred[:, c : c + w].max(axis=-1) - centred[:, c - w : c].min(axis=-1)
+        # a Taylor front (dp/2) tanh(tau / T) of jump dp has the rise 2 artanh(0.8) T and the
+        # largest slope dp / (2 T) = artanh(0.8) dp / rise. Fronts steeper than one of rise
+        # GATE tau_sh are smoothed: GATE > 1 keeps a front held at tau_sh smoothed.
+        steeper = slope * self.rise_time * GATE > math.atanh(0.8) * jump
+        delta_a = np.maximum(self._delta_per_pa * jump - self.diffusivity, 0.0)
+        return np.where(steeper & (jump > 0), delta_a, 0.0)
+
+    def _godunov(self, p: ComplexArray, dz: float, nsub: int) -> tuple[ComplexArray, float]:
+        """MUSCL-Godunov with Heun steps over ``nsub`` sub-steps, on the waveform.
+
+        Returns the new harmonics and the largest artificial diffusivity applied (0 without
+        smoothing).
+        """
         nt = self.n_godunov
         u = waveform(p, nt, axis=-1)
         dtau = self.period / nt
@@ -280,4 +364,11 @@ class NonlinearOperator:
             u1 += h * self._flux_divergence(u1, dtau)
             u += u1
             u *= 0.5
-        return harmonics_of(u, p.shape[1], axis=-1).astype(p.dtype, copy=False)
+        out = harmonics_of(u, p.shape[1], axis=-1).astype(p.dtype, copy=False)
+        if self.smoothing is None:
+            return out, 0.0
+        delta_a = self._artificial_diffusivity(u, dtau)
+        top = float(delta_a.max(initial=0.0))
+        if top > 0:
+            out *= np.exp(-dz * delta_a[:, None] * self._viscous[None, : p.shape[1]]).astype(out.real.dtype)
+        return out, top

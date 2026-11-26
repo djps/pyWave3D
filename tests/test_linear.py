@@ -182,3 +182,45 @@ def test_pml_against_wrap_around(water: pw.Medium) -> None:
     # a beam along z next to the edge: the PML hardly touches it, the sponge eats into it
     e = errors(0.0, 6e-3, 40)
     assert e["pml"] < 0.1 * e["sponge"]
+
+
+def test_shock_smoothing_profile() -> None:
+    f = 0.05
+    sm = pw.AxialSmoothing(focal_length=f, peak_multiplier=20.0, post_focal_multiplier=3.0)
+    m = sm.multiplier(np.array([0.0, 0.995 * f, 2 * f]))
+    np.testing.assert_allclose(m, [1.0, 20.0, 3.0], rtol=2e-3)  # tanh(3.5) at the centre
+    # the paper's form: a1 + (A - 1)/2 [tanh - a2 tanh], a1 = (1 + B)/2, a2 = 1 + (1 - B)/(A - 1)
+    a, b = 20.0, 3.0
+    z = np.linspace(0.9 * f, 1.1 * f, 101)
+    paper = (1 + b) / 2 + (a - 1) / 2 * (
+        np.tanh((z - 0.96 * f) / (0.01 * f)) - (1 + (1 - b) / (a - 1)) * np.tanh((z - 1.03 * f) / (0.01 * f))
+    )
+    np.testing.assert_allclose(sm.multiplier(z), paper, rtol=1e-12)
+    # the step integral is exact, also over a step much longer than the widths
+    za, zb = 0.9 * f, 1.2 * f
+    zz = np.linspace(za, zb, 200001)
+    mm = sm.multiplier(zz) - 1
+    np.testing.assert_allclose(sm.excess(za, zb), np.sum((mm[1:] + mm[:-1]) / 2 * np.diff(zz)), rtol=1e-8)
+    assert pw.AxialSmoothing(focal_length=f, peak_multiplier=1.0).excess(0.0, 2 * f) == 0.0
+    with pytest.raises(ValueError):
+        pw.AxialSmoothing(start=1.1, end=1.0)
+    with pytest.raises(ValueError):
+        pw.AxialSmoothing().multiplier(0.0)  # no focal length
+
+
+def test_shock_smoothing_scales_the_diffusivity(small_grid: pw.Grid, water: pw.Medium) -> None:
+    f = 0.05
+    sm = pw.AxialSmoothing(focal_length=f, peak_multiplier=7.0)
+    lin = pw.LinearPropagator(small_grid, water, F0, smoothing=sm)
+    shape = (small_grid.n_harmonics, small_grid.nx, small_grid.ny)
+    alpha = water.alpha(F0, np.arange(1.0, small_grid.n_harmonics + 1))
+    # well before the focus: the physical absorption only
+    p = np.ones(shape, dtype=complex)
+    lin.apply(p, z=small_grid.z0)
+    np.testing.assert_allclose(p[:, 3, 5], np.exp(-alpha * small_grid.dz), rtol=1e-9)
+    # inside the peak: seven times the diffusivity
+    p = np.ones(shape, dtype=complex)
+    lin.apply(p, z=small_grid.z0 + 0.995 * f)
+    np.testing.assert_allclose(p[:, 3, 5], np.exp(-7 * alpha * small_grid.dz), rtol=1e-3)
+    with pytest.raises(ValueError):
+        lin.apply(p)  # the position is needed

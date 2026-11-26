@@ -178,3 +178,35 @@ def test_cli_progress_flag(monkeypatch) -> None:
     monkeypatch.setattr(cli, "simulate", fake_simulate)
     assert cli.main(["1"]) == 1 and seen.pop() is None  # None: the options decide
     assert cli.main(["1", "--no-progress"]) == 1 and seen.pop() is False
+
+
+def test_shock_smoothing_settings_and_run() -> None:
+    assert pw.SolverSettings.from_options(Options({})).shock_smoothing is None
+    assert pw.SolverSettings.from_options(Options({"ShockSmoothing": {"enabled": False}})).shock_smoothing is None
+    s = pw.SolverSettings.from_options(
+        Options({"ShockSmoothing": {"peak_multiplier": 20, "post_focal_multiplier": 2, "start_width": 0.02}})
+    )
+    sm = s.shock_smoothing
+    assert sm is not None
+    assert (sm.peak_multiplier, sm.post_focal_multiplier, sm.start, sm.end) == (20, 2, 0.96, 1.03)
+    assert (sm.start_width, sm.end_width, sm.focal_length) == (0.02, 0.01, 0.0)
+    adaptive = pw.SolverSettings.from_options(Options({"ShockSmoothing": {"type": "adaptive", "rise_points": 9}}))
+    assert adaptive.shock_smoothing == pw.AdaptiveSmoothing(rise_points=9)
+    with pytest.raises(TypeError):
+        pw.SolverSettings.from_options(Options({"ShockSmoothing": {"type": "spatial"}}))
+
+    # a linear run: the smoothing lowers the field only from the start of the profile on
+    model = focused_model()
+    grid = model.make_grid(Options({"NumberOfPointsPerWaveLength": 4, "SamplingFrequencyMultiplier": 4}))
+    plain = pw.WaveSolver(model, grid, pw.SolverSettings(nonlinearity=False)).run()
+    smoothed = pw.WaveSolver(
+        model,
+        grid,
+        pw.SolverSettings(nonlinearity=False, shock_smoothing=pw.AxialSmoothing(peak_multiplier=1e4)),
+    ).run()
+    zf = model.transducer.focusing_depth
+    before = plain.z - grid.z0 < 0.9 * zf
+    after = plain.z - grid.z0 > 1.05 * zf
+    a0, a1 = np.abs(plain.axis[:, 0]), np.abs(smoothed.axis[:, 0])
+    np.testing.assert_allclose(a1[before], a0[before], rtol=1e-6)
+    assert np.all(a1[after] < 0.99 * a0[after])

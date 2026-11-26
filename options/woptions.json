@@ -38,6 +38,17 @@
       "NumberOfPointsPerWaveLength": 8,
       "SamplingFrequencyMultiplier": 8
     },
+    "ShockSmoothing": {
+      "enabled": false,
+      "type": "axial",
+      "peak_multiplier": 5.0,
+      "post_focal_multiplier": 1.0,
+      "start": 0.96,
+      "end": 1.03,
+      "start_width": 0.01,
+      "end_width": 0.01,
+      "rise_points": 7
+    },
     "Metrics": {
       "enabled": true,
       "file": "metrics.json",

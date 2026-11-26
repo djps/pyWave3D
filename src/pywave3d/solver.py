@@ -19,6 +19,10 @@ The ``Solver`` section of the options file selects the parts and the outputs::
                          "Type": "full"},
       "NonlinearSolver": {"method": "auto", "switch_threshold": 1e-3,
                           "amplitude_threshold": 1e-4, "cfl": 0.5},
+      "ShockSmoothing": {"enabled": true, "type": "axial", "peak_multiplier": 5,
+                         "post_focal_multiplier": 1, "start": 0.96, "end": 1.03,
+                         "start_width": 0.01, "end_width": 0.01, "focal_length": 0.05,
+                         "rise_points": 7},
       "Metrics": {"focal_quantity": "p_positive", "harmonics": 4, "levels_dB": [-6, -3, -12, -20],
                   "hydrophone_diameter": 0.0, "derating": 0.3, "face_distance": 0.003},
       "Output": {"every": 1, "plane_peaks": true, "progress_bar": true,
@@ -27,11 +31,21 @@ The ``Solver`` section of the options file selects the parts and the outputs::
     }
 
 All switches default to on except the absorbing layer: nonlinear propagation with absorption.
+
+``ShockSmoothing`` adds artificial absorption against the oscillations that shocks cause. It
+is on when the block is present, unless ``enabled`` is false. ``type`` chooses how:
+
+* ``"axial"`` (the default): a fixed multiplier of the diffusivity along z, peaking around the
+  focus (:class:`AxialSmoothing`; Yuldashev and Khokhlova 2011). ``start``, ``end`` and the
+  widths are fractions of the focal length, which defaults to the transducer's focusing depth;
+* ``"adaptive"``: at each point, the diffusivity that holds the shock there at a rise time of
+  ``rise_points`` steps of the time grid (:class:`AdaptiveSmoothing`; Maxwell et al. 2017).
 """
 
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import logging
 import math
 import time
@@ -44,9 +58,9 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 
 from pywave3d._types import ComplexArray
 from pywave3d.grid import Grid
-from pywave3d.linear import LinearPropagator
+from pywave3d.linear import AxialSmoothing, LinearPropagator
 from pywave3d.model import WaveModel
-from pywave3d.nonlinear import NonlinearMethod, NonlinearOperator
+from pywave3d.nonlinear import AdaptiveSmoothing, NonlinearMethod, NonlinearOperator
 from pywave3d.options import Options
 from pywave3d.recorder import PlaneRecorder, RecordSettings
 from pywave3d.results import FocalQuantity, Results
@@ -78,6 +92,9 @@ class SolverSettings:
         workers: threads for the FFTs.
         progress_bar: show a tqdm progress bar over the steps of the march (only when
             stderr is a terminal; otherwise progress is logged every 5 %).
+        shock_smoothing: artificial absorption against shock oscillations: along z around the
+            focus (:class:`AxialSmoothing`), at each shock (:class:`AdaptiveSmoothing`), or
+            None (the default).
     """
 
     diffraction: bool = True
@@ -102,6 +119,7 @@ class SolverSettings:
     single_precision: bool = False
     workers: int = 1
     progress_bar: bool = True
+    shock_smoothing: AxialSmoothing | AdaptiveSmoothing | None = None
 
     @classmethod
     def from_options(cls, opts: Options, workers: int = 1) -> SolverSettings:
@@ -118,6 +136,25 @@ class SolverSettings:
         nl = opts.child("NonlinearSolver")
         met = opts.child("Metrics")
         out = opts.child("Output")
+        sm = opts.child("ShockSmoothing")
+        smoothing: AxialSmoothing | AdaptiveSmoothing | None = None
+        kind = sm.get("type", str, "axial").lower()
+        if kind not in ("axial", "adaptive"):
+            raise TypeError(f"options: '{sm.path}.type' should be 'axial' or 'adaptive', not {kind!r}")
+        enabled = sm.get("enabled", bool, sm.exists())
+        if enabled and kind == "adaptive":
+            smoothing = AdaptiveSmoothing(rise_points=sm.get("rise_points", float, AdaptiveSmoothing().rise_points))
+        elif enabled:
+            ds = AxialSmoothing()
+            smoothing = AxialSmoothing(
+                focal_length=sm.get("focal_length", float, ds.focal_length),
+                peak_multiplier=sm.get("peak_multiplier", float, ds.peak_multiplier),
+                post_focal_multiplier=sm.get("post_focal_multiplier", float, ds.post_focal_multiplier),
+                start=sm.get("start", float, ds.start),
+                end=sm.get("end", float, ds.end),
+                start_width=sm.get("start_width", float, ds.start_width),
+                end_width=sm.get("end_width", float, ds.end_width),
+            )
         levels = met.get("levels_dB", list[float], d.levels_db)
         points: list[tuple[str, tuple[float, float, float]]] = []
         for p in out.children("xyz"):
@@ -147,6 +184,7 @@ class SolverSettings:
             face_distance=met.get("face_distance", float, d.face_distance),
             single_precision=opts.get("precision", str, "double").lower() == "single",
             workers=workers,
+            shock_smoothing=smoothing,
         )
 
 
@@ -157,6 +195,9 @@ class WaveSolver:
         model: the model (medium, source, transducer).
         grid: the grid; by default built by ``model.make_grid()``.
         settings: the solver settings; by default nonlinear propagation with absorption.
+
+    Shock smoothing without a focal length takes the transducer's focusing depth; it is an
+    error if that is 0 (an unfocused piston).
     """
 
     def __init__(self, model: WaveModel, grid: Grid | None = None, settings: SolverSettings | None = None) -> None:
@@ -165,6 +206,15 @@ class WaveSolver:
         self.settings = settings if settings is not None else SolverSettings()
         s = self.settings
         self.dtype = np.complex64 if s.single_precision else np.complex128
+        smoothing = s.shock_smoothing if isinstance(s.shock_smoothing, AxialSmoothing) else None
+        adaptive = s.shock_smoothing if isinstance(s.shock_smoothing, AdaptiveSmoothing) else None
+        if smoothing is not None and smoothing.focal_length == 0:
+            depth = model.transducer.focusing_depth
+            if depth <= 0:
+                raise ValueError("shock smoothing: set focal_length (the transducer is unfocused)")
+            smoothing = dataclasses.replace(smoothing, focal_length=depth)
+        self.smoothing = smoothing
+        self.adaptive = adaptive
         self.linear = LinearPropagator(
             self.grid,
             model.medium,
@@ -175,6 +225,7 @@ class WaveSolver:
             layer=model.layer if s.absorbing_layer else None,
             dtype=self.dtype,
             workers=s.workers,
+            smoothing=smoothing,
         )
         self.nonlinear = (
             NonlinearOperator(
@@ -186,6 +237,7 @@ class WaveSolver:
                 amplitude_threshold=s.amplitude_threshold,
                 cfl=s.cfl,
                 workers=s.workers,
+                smoothing=adaptive,
             )
             if s.nonlinearity and model.medium.nonlinearity > 0
             else None
@@ -270,6 +322,28 @@ class WaveSolver:
                 for v in (s.diffraction, self.nonlinear is not None, s.absorption, s.absorbing_layer)
             ),
         )
+        if self.smoothing is not None:
+            sm = self.smoothing
+            f = sm.focal_length
+            log.info(
+                "Shock smoothing: diffusivity x %g from z = %.4e m, x %g from z = %.4e m (widths %.2e, %.2e m)",
+                sm.peak_multiplier,
+                g.z0 + sm.start * f,
+                sm.post_focal_multiplier,
+                g.z0 + sm.end * f,
+                sm.start_width * f,
+                sm.end_width * f,
+            )
+        if self.adaptive is not None:
+            if self.nonlinear is None:
+                log.warning("Adaptive shock smoothing needs the nonlinear step: it does nothing here")
+            else:
+                log.info(
+                    "Adaptive shock smoothing: shock rise time %.3e s (%g steps of the time grid)",
+                    self.nonlinear.rise_time,
+                    self.adaptive.rise_points,
+                )
+        max_artificial = 0.0
         store(0)
         record_before = timings["record"]
         pending = False  # a half linear step is owed from the previous step
@@ -286,22 +360,28 @@ class WaveSolver:
         with bar, logging_redirect_tqdm() if not bar.disable else contextlib.nullcontext():
             for step in range(1, nsteps + 1):
                 t0 = time.perf_counter()
+                z_prev = float(g.z[step - 1])
                 if self.nonlinear is None:
-                    self.linear.apply(self.field, 1.0, self.n_active)
+                    self.linear.apply(self.field, 1.0, self.n_active, z_prev)
                     t1 = time.perf_counter()
                 else:
-                    self.linear.apply(self.field, 1.0 if pending else 0.5, self.n_active)
+                    # the owed half step of the previous step starts dz/2 before z_prev
+                    if pending:
+                        self.linear.apply(self.field, 1.0, self.n_active, z_prev - g.dz / 2)
+                    else:
+                        self.linear.apply(self.field, 0.5, self.n_active, z_prev)
                     t1 = time.perf_counter()
                     method = self.nonlinear.apply(self.field, g.dz, self.n_active)
                     if method == "godunov" and math.isnan(godunov_from):
                         godunov_from = float(g.z[step - 1] + g.dz / 2)
                         log.info("Shock-capturing (Godunov) nonlinear step from z = %.4e m", godunov_from)
+                    max_artificial = max(max_artificial, self.nonlinear.last_artificial_diffusivity)
                     self.n_active = self._active_harmonics()
                     pending = True
                 t2 = time.perf_counter() if self.nonlinear is not None else t1
                 if record[step]:
                     if pending:
-                        self.linear.apply(self.field, 0.5, self.n_active)
+                        self.linear.apply(self.field, 0.5, self.n_active, float(g.z[step]) - g.dz / 2)
                         pending = False
                     store(step)
                 t3 = time.perf_counter()
@@ -327,6 +407,8 @@ class WaveSolver:
                     )
         if self.nonlinear is not None:
             self.nonlinear.close()
+        if self.adaptive is not None and self.nonlinear is not None:
+            log.info("Adaptive shock smoothing: largest artificial diffusivity %.3e m^2/s", max_artificial)
         timings["linear"] -= timings["record"] - record_before
         timings["total"] = time.perf_counter() - t_start
         log.info(
