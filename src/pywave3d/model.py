@@ -280,8 +280,14 @@ class WaveModel:
             layer = AbsorbingLayer(width, ab.get("strength", float, 0.0), power, kind, levels)
 
         return cls(
-            medium, frequency, lengths, tuple(origin), transducer, cls._read_source(opts.child("Initial")), layer
-        )  # type: ignore[arg-type]
+            medium,
+            frequency,
+            lengths,
+            (origin[0], origin[1], origin[2]),
+            transducer,
+            cls._read_source(opts.child("Initial")),
+            layer,
+        )
 
     @staticmethod
     def _read_source(ini: Options) -> Source | None:

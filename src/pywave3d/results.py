@@ -487,7 +487,7 @@ class Results:
         written.append(path)
         with written[1].open("w", encoding="utf-8") as f:
             json.dump(self.metrics(harmonics), f, indent=2, allow_nan=True)
-        arrays = {k: v for k, v in vars(self).items() if isinstance(v, np.ndarray)}
+        arrays: dict[str, Any] = {k: v for k, v in vars(self).items() if isinstance(v, np.ndarray)}
         np.savez_compressed(written[2], x=self.grid.x, y=self.grid.y, **arrays)
         if self.focal_plane is not None:
             maps = self.plane_maps(self.focal_plane)

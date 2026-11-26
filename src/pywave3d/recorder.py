@@ -218,11 +218,12 @@ class PlaneRecorder:
             pmax = np.full((g.nx, g.ny), -np.inf)
             pmax[cand] = plane.max(axis=0)
             np.maximum(self._max_pp, pmax, out=self._max_pp)
-            pl_pp = max(pmax.max(), xz_pp.max(), yz_pp.max())
-            pl_pm = min(plane.min(initial=0.0), xz_pm.min(), yz_pm.min())
+            pl_pp = float(max(pmax.max(), xz_pp.max(), yz_pp.max()))
+            pl_pm = float(min(plane.min(initial=0.0), xz_pm.min(), yz_pm.min()))
             if pl_pp > self._peak["value"]:
                 if pmax.max() >= pl_pp:
-                    i, j = np.unravel_index(int(np.argmax(pmax)), pmax.shape)
+                    ii, jj = np.unravel_index(int(np.argmax(pmax)), pmax.shape)
+                    i, j = int(ii), int(jj)
                 elif xz_pp.max() >= yz_pp.max():
                     i, j = int(np.argmax(xz_pp)), iy
                 else:

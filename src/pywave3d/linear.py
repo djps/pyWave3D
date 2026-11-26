@@ -223,10 +223,10 @@ class LinearPropagator:
             self._half = np.exp(-loss * grid.dz / 2).astype(dtype)[:, None, None]
 
         if layer is not None and layer.kind == "sponge":
-            sigma = layer.profile(grid)
-            if sigma is not None:
-                self._layer_full = np.exp(-sigma * grid.dz).astype(real)
-                self._layer_half = np.exp(-sigma * grid.dz / 2).astype(real)
+            sponge = layer.profile(grid)
+            if sponge is not None:
+                self._layer_full = np.exp(-sponge * grid.dz).astype(real)
+                self._layer_half = np.exp(-sponge * grid.dz / 2).astype(real)
 
     def apply(self, field: ComplexArray, fraction: float = 1.0, n_active: int | None = None) -> None:
         """Advance ``field`` (shape (K, nx, ny)) in place by ``fraction`` x dz.

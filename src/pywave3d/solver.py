@@ -21,7 +21,7 @@ The ``Solver`` section of the options file selects the parts and the outputs::
                           "amplitude_threshold": 1e-4, "cfl": 0.5},
       "Metrics": {"focal_quantity": "p_positive", "harmonics": 4, "levels_dB": [-6, -3, -12, -20],
                   "hydrophone_diameter": 0.0, "derating": 0.3, "face_distance": 0.003},
-      "Output": {"every": 1, "plane_peaks": true,
+      "Output": {"every": 1, "plane_peaks": true, "progress_bar": true,
                  "xyz": [{"name": "p0.txt", "position": [0.02, 0.02, 0.0]}]},
       "precision": "double"
     }
@@ -31,6 +31,7 @@ All switches default to on except the absorbing layer: nonlinear propagation wit
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import time
@@ -38,6 +39,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+from tqdm.auto import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 from pywave3d._types import ComplexArray
 from pywave3d.grid import Grid
@@ -73,6 +76,8 @@ class SolverSettings:
             radiating area of IEC 61689 [m] (0.3 cm).
         single_precision: use complex64 fields.
         workers: threads for the FFTs.
+        progress_bar: show a tqdm progress bar over the steps of the march (only when
+            stderr is a terminal; otherwise progress is logged every 5 %).
     """
 
     diffraction: bool = True
@@ -96,6 +101,7 @@ class SolverSettings:
     face_distance: float = 0.003
     single_precision: bool = False
     workers: int = 1
+    progress_bar: bool = True
 
     @classmethod
     def from_options(cls, opts: Options, workers: int = 1) -> SolverSettings:
@@ -113,7 +119,7 @@ class SolverSettings:
         met = opts.child("Metrics")
         out = opts.child("Output")
         levels = met.get("levels_dB", list[float], d.levels_db)
-        points = []
+        points: list[tuple[str, tuple[float, float, float]]] = []
         for p in out.children("xyz"):
             pos = p.get("position", list[float], None)
             if pos is None or len(pos) != 3:
@@ -131,6 +137,7 @@ class SolverSettings:
             cfl=nl.get("cfl", float, d.cfl),
             record_every=max(1, out.get("every", int, d.record_every)),
             plane_peaks=out.get("plane_peaks", bool, d.plane_peaks),
+            progress_bar=out.get("progress_bar", bool, d.progress_bar),
             points=points,
             focal_quantity=met.get("focal_quantity", str, d.focal_quantity),  # type: ignore[arg-type]
             metrics_harmonics=met.get("harmonics", int, d.metrics_harmonics),
@@ -268,39 +275,56 @@ class WaveSolver:
         pending = False  # a half linear step is owed from the previous step
         progress = max(1, nsteps // 20)
         t_start = time.perf_counter()
-        for step in range(1, nsteps + 1):
-            t0 = time.perf_counter()
-            if self.nonlinear is None:
-                self.linear.apply(self.field, 1.0, self.n_active)
-                t1 = time.perf_counter()
-            else:
-                self.linear.apply(self.field, 1.0 if pending else 0.5, self.n_active)
-                t1 = time.perf_counter()
-                method = self.nonlinear.apply(self.field, g.dz, self.n_active)
-                if method == "godunov" and math.isnan(godunov_from):
-                    godunov_from = float(g.z[step - 1] + g.dz / 2)
-                    log.info("Shock-capturing (Godunov) nonlinear step from z = %.4e m", godunov_from)
-                self.n_active = self._active_harmonics()
-                pending = True
-            t2 = time.perf_counter() if self.nonlinear is not None else t1
-            if record[step]:
-                if pending:
-                    self.linear.apply(self.field, 0.5, self.n_active)
-                    pending = False
-                store(step)
-            t3 = time.perf_counter()
-            timings["linear"] += (t1 - t0) + (t3 - t2)
-            timings["nonlinear"] += t2 - t1
-            if step % progress == 0 or step == nsteps:
-                log.info(
-                    "step %*d / %d  z = %.4e m  max p+ on axis %.4e Pa  harmonics %d",
-                    len(str(nsteps)),
-                    step,
-                    nsteps,
-                    g.z[step],
-                    recorder.axis_p_plus_max,
-                    self.n_active,
-                )
+        bar = tqdm(
+            total=nsteps,
+            desc="march",
+            unit="step",
+            disable=None if s.progress_bar else True,  # None: off when stderr is not a terminal
+            dynamic_ncols=True,
+        )
+        # route log records through tqdm.write so they print above the bar
+        with bar, logging_redirect_tqdm() if not bar.disable else contextlib.nullcontext():
+            for step in range(1, nsteps + 1):
+                t0 = time.perf_counter()
+                if self.nonlinear is None:
+                    self.linear.apply(self.field, 1.0, self.n_active)
+                    t1 = time.perf_counter()
+                else:
+                    self.linear.apply(self.field, 1.0 if pending else 0.5, self.n_active)
+                    t1 = time.perf_counter()
+                    method = self.nonlinear.apply(self.field, g.dz, self.n_active)
+                    if method == "godunov" and math.isnan(godunov_from):
+                        godunov_from = float(g.z[step - 1] + g.dz / 2)
+                        log.info("Shock-capturing (Godunov) nonlinear step from z = %.4e m", godunov_from)
+                    self.n_active = self._active_harmonics()
+                    pending = True
+                t2 = time.perf_counter() if self.nonlinear is not None else t1
+                if record[step]:
+                    if pending:
+                        self.linear.apply(self.field, 0.5, self.n_active)
+                        pending = False
+                    store(step)
+                t3 = time.perf_counter()
+                timings["linear"] += (t1 - t0) + (t3 - t2)
+                timings["nonlinear"] += t2 - t1
+                bar.update()
+                if not bar.disable:
+                    bar.set_postfix(
+                        z=f"{g.z[step]:.3e} m",
+                        p_axis=f"{recorder.axis_p_plus_max:.3e} Pa",
+                        harmonics=self.n_active,
+                        refresh=False,
+                    )
+                elif step % progress == 0 or step == nsteps:
+                    log.info(
+                        "step %*d / %d  z = %.4e m  max p+ on axis %.4e Pa  harmonics %d",
+                        len(str(nsteps)),
+                        step,
+                        nsteps,
+                        g.z[step],
+                        recorder.axis_p_plus_max,
+                        self.n_active,
+                    )
         if self.nonlinear is not None:
             self.nonlinear.close()
         timings["linear"] -= timings["record"] - record_before
@@ -320,13 +344,17 @@ class WaveSolver:
         )
 
 
-def simulate(options: str | Path | Options | None = None, workers: int = 1) -> Results:
+def simulate(
+    options: str | Path | Options | None = None, workers: int = 1, progress_bar: bool | None = None
+) -> Results:
     """Run a simulation from an options file (or node), or the water default if None.
 
     Args:
         options: path of a JSON options file, an :class:`Options` node, or None for the
             defaults (a 50 W, 1 MHz focused transducer in water, nonlinear and lossy).
         workers: threads for the FFTs.
+        progress_bar: show the progress bar of the march; None takes it from the options
+            (``Solver.Output.progress_bar``, default true).
     """
     if options is None:
         opts = Options({})
@@ -338,4 +366,6 @@ def simulate(options: str | Path | Options | None = None, workers: int = 1) -> R
     solver_opts = opts.child("Solver")
     grid = model.make_grid(solver_opts.child("DiffractSolver"))
     settings = SolverSettings.from_options(solver_opts, workers)
+    if progress_bar is not None:
+        settings.progress_bar = progress_bar
     return WaveSolver(model, grid, settings).run()

@@ -4,17 +4,17 @@
 [![Coverage Status](https://coveralls.io/repos/github/djps/pyWave3D/badge.svg?branch=main)](https://coveralls.io/github/djps/pyWave3D?branch=main)
 [![made-with-python](https://img.shields.io/badge/Made%20with-Python-1f425f.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-yellow.svg)](./LICENSE.md)
+[![PyPI version](https://img.shields.io/pypi/v/pywave3d)](https://pypi.org/project/pywave3d/)
 
+Pseudo-spectral spatial-marching scheme for nonlinear ultrasound from holography data, or discretised analytical data.
 
-Pseudo-spectral spatial-marching scheme for nonlinear ultrasound from holography data.
-
-pyWave3D computes nonlinear ultrasound beams in three dimensions. It reads JSON options files and source-plane inputs (for example a hologram measured on a plane in front of the transducer).
+pyWave3D computes nonlinear ultrasound beams in three dimensions. It reads a JSON options file and source-plane input (for example a hologram measured on a plane near the front of the transducer).
 
 By default, pyWave3D models **nonlinear propagation in water with thermoviscous absorption**, which grows with the square of the frequency.
 
 ## The method
 
-The pressure on each plane $z = \text{const}$ is stored as the complex values of its harmonics in the retarded time $\tau = t - z/c_0$:
+The pressure on each plane $z = \text{const}$ is stored as the complex values of its $n$ harmonics in the retarded time $\tau = t - z/c_0$:
 
 ```math
 p(x, y, z, \tau) = \mathfrak{Re} \sum_{n=1}^{K} P_n(x, y, z) \, e^{+i n \omega \tau} .
@@ -22,7 +22,11 @@ p(x, y, z, \tau) = \mathfrak{Re} \sum_{n=1}^{K} P_n(x, y, z) \, e^{+i n \omega \
 
 From the real and the imaginary parts, the phase and the amplitude can be computed.
 
-The field is marched from the source plane along $z$ by second-order (Strang) operator splitting of the one-way Westervelt equation. This is the approach of the Moscow State University HIFU simulators (Yuldashev and Khokhlova, *Acoust. Phys.* 57, 2011; Yuldashev et al., *IEEE TUFFC* 68, 2021). Each step of length $\Delta z$ is $L(\Delta z/2) \, N(\Delta z) \, L(\Delta z/2)$.
+The field is marched from the source plane along $z$ by second-order (Strang) operator splitting of the one-way Westervelt equation[^1].
+
+[^1]: P. V. Yuldashev and V. A. Khokhlova, "[Simulation of three-dimensional nonlinear fields of ultrasound therapeutic arrays](https://doi.org/10.1134/S1063771011030213)," _Acoust. Phys._, vol. **57**(3), pp. 334-343 (2011).
+
+Each step of length $\Delta z$ is comprised of a half linear step, a nonlinear step and a half linear step $L(\Delta z/2) \, N(\Delta z) \, L(\Delta z/2)$.
 
 ### Linear step $L$
 
@@ -60,7 +64,7 @@ The two linear half-steps between unrecorded planes are merged into one. This is
 
 Points below $10^{-4}$ of the plane maximum skip the nonlinear step, and the nonlinear step works on cache-sized chunks of points on a thread pool.
 
-Plane peaks are computed only at points where the bound $\sum_n \lvert P_n \rvert$ can beat the values already known.
+Plane peaks are computed only at points where the bound $\sum_n \lvert P_n \rvert$ is greater than the values already computed.
 
 ### Defaults
 
@@ -68,20 +72,33 @@ The defaults are water at 20 °C ($c_0 = 1482$ m/s, $\rho_0 = 998$ kg/m³, $\bet
 
 ## Installing
 
-Requires Python ≥ 3.10, numpy, scipy and beartype. From the repository root:
+Requires Python ≥ 3.10, numpy, scipy, beartype and tqdm; on Python 3.14, numpy ≥ 2.3.2 (see below). From the repository root:
 
 ```
 pip install -e ".[test]"   # or ".[dev]" for ruff and mypy as well
 ```
 
+### numpy and Python 3.14: wrong results on large arrays
+
+numpy saves memory in an expression like `a + b` by writing the result into an operand's buffer when it believes nothing else refers to that operand ("temporary elision"). It decides this from the reference count, and Python 3.14 changed how local variables are counted. numpy releases before 2.3 therefore overwrite *named local arrays that are still in use* on Python 3.14:
+
+```python
+c = -a
+d = c + b  # numpy 2.2 on Python 3.14: c now holds c + b
+```
+
+numpy only does this for arrays of at least 256 KiB, so small cases (and most unit tests) are unaffected, while realistic grids give silently wrong fields. In pyWave3D it corrupts the linear half-step operator (`exp(exponent · dz)` is written back into `exponent`), the RK4 stages of the spectral nonlinear step, and the MUSCL–Godunov update. With numpy 2.2.6 on Python 3.14, the focal waveform of a strongly nonlinear beam stays symmetric and the Godunov result depends on the chunking.
+
+The dependency `numpy>=2.3.2; python_version >= '3.14'` prevents the combination at install time; numpy 2.3.2 is the first release with Python 3.14 wheels, and it is correct. pip does not recheck an existing environment, so check one with `python -c "import sys, numpy; print(sys.version, numpy.__version__)"`. k-wave-python 0.6.2 requires `numpy<2.3`, and is affected in the same way, so run the k-Wave comparisons (`tests/test_kwave.py`) on Python 3.12 or 3.13.
+
 ## Running
 
 ```
-pywave3d [nthreads] [options.json] [-o OUTDIR] [-q | -v]
+pywave3d [nthreads] [options.json] [-o OUTDIR] [-q | -v] [--no-progress]
 python -m pywave3d 8 examples/water_focused.json -o out
 ```
 
-With no options file, pyWave3D runs the default water case. It has 405 steps on a 168 × 168 grid and takes about 45 s on 8 threads.
+Without an options file, pyWave3D runs the default water case. It has 405 steps on a 168 × 168 grid and takes about 45 s on 8 threads. A progress bar tracks the march when the output is a terminal; `--no-progress` turns it off.
 
 From Python:
 
@@ -182,7 +199,7 @@ Keys are case-insensitive, dotted paths walk nested objects, and a value of the 
 | `Solver.DiffractSolver` | `NumberOfPointsPerWaveLength` (6, or [x, y, z]), `SamplingFrequencyMultiplier` (32 samples per period, i.e. 16 harmonics), `NumberOfPoints` ([nx, ny, nz]), `Type` (`full` or `parabolic`), `FastFFTSizes` (true: round $n_x$ and $n_y$ up to FFT-friendly even sizes) |
 | `Solver.NonlinearSolver` | `method` (`auto`, `spectral`, `godunov`), `switch_threshold` (1e-3), `amplitude_threshold` (1e-4), `cfl` (0.5) |
 | `Solver.Metrics` | `focal_quantity` (`p_positive`), `harmonics` (4), `levels_dB` ([-6, -3, -12, -20]; the first is the main level), `hydrophone_diameter` (0 m: no averaging), `derating` (0.3 dB/(cm MHz)), `face_distance` (0.003 m, the plane for $A_{\mathrm{ER}}$) |
-| `Solver.Output` | `every` (record every $n$-th plane, 1), `plane_peaks` (true), `xyz` (points `{"name", "position"}`) |
+| `Solver.Output` | `every` (record every $n$-th plane, 1), `plane_peaks` (true), `progress_bar` (true: a progress bar over the march when run in a terminal), `xyz` (points `{"name", "position"}`) |
 | `Solver.precision` | `double` (default) or `single` |
 
 The reference file `options/woptions.json` sets `"NLN": false`, so it runs linear. A missing switch defaults to on.
@@ -260,7 +277,7 @@ Compares the linear field with k-Wave's continuous-wave angular spectrum solver 
 
 It also runs a time-domain k-Wave case (pure-Python backend, a 3.5 mm piston on a 40 × 24 × 24 grid, about 12 s), reduced by `preprocess.time_domain.from_kwave`: its first plane marched by pyWave3D, zero-padded against periodic images, agrees with k-Wave's own axis to 4% of the peak.
 
-It is skipped if `kwave` is not installed. The first import of `kwave` downloads its binaries (about 200 MB).
+It is skipped if `kwave` is not installed. On Python 3.14, k-wave-python 0.6.2 forces numpy < 2.3, which gives wrong results on large arrays (see [numpy and Python 3.14](#numpy-and-python-314-wrong-results-on-large-arrays)): use Python 3.12 or 3.13 for these tests. The first import of `kwave` downloads its binaries (about 200 MB).
 
 ### `test_iec.py`
 

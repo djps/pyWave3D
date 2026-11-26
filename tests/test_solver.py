@@ -101,6 +101,8 @@ def test_settings_from_options() -> None:
     assert not s.nonlinearity and not s.absorption and s.paraxial and s.diffraction
     d = pw.SolverSettings.from_options(Options({}))
     assert d.nonlinearity and d.absorption and d.diffraction and not d.absorbing_layer
+    assert d.progress_bar
+    assert not pw.SolverSettings.from_options(Options({"Output": {"progress_bar": False}})).progress_bar
     with pytest.raises(TypeError):
         pw.SolverSettings.from_options(Options({"DiffractSolver": {"Type": "2DSym"}}))
 
@@ -162,3 +164,17 @@ def test_pruned_plane_peaks_equal_brute_force() -> None:
     assert res.max_p_plus is not None
     assert np.all(res.max_p_plus >= w.max(axis=0) - 1e-6 * w.max())
     assert res.max_p_plus.max() == pytest.approx(np.nanmax(res.plane_p_plus))
+
+
+def test_cli_progress_flag(monkeypatch) -> None:
+    import pywave3d.cli as cli
+
+    seen = []
+
+    def fake_simulate(opts, workers, progress_bar):
+        seen.append(progress_bar)
+        raise ValueError("stop here")  # main reports it and returns 1
+
+    monkeypatch.setattr(cli, "simulate", fake_simulate)
+    assert cli.main(["1"]) == 1 and seen.pop() is None  # None: the options decide
+    assert cli.main(["1", "--no-progress"]) == 1 and seen.pop() is False
