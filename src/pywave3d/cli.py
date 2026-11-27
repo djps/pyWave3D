@@ -1,5 +1,6 @@
 """Command line: ``pywave3d [nthreads] [options.json] [-o DIR] [-q | -v] [--no-progress]
-[--precision {single,double}]``.
+[--precision {single,double}]
+[--diffraction {full,parabolic,pade}] [--pade-order {1,2,3}]``.
 
 Without an options file the built-in default runs: a 50 W, 1 MHz focused transducer
 (radius 12.5 mm, focus 50 mm) in water, with nonlinearity and thermoviscous absorption.
@@ -13,8 +14,9 @@ import logging
 import sys
 from pathlib import Path
 
+from pywave3d.linear import PADE_ORDERS
 from pywave3d.options import Options
-from pywave3d.solver import PRECISIONS, simulate
+from pywave3d.solver import DIFFRACTION_TYPES, PRECISIONS, simulate
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -42,6 +44,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="precision of the march: complex128 (double) or complex64 (single) fields "
         "(overrides Solver.precision; default double)",
     )
+    p.add_argument(
+        "--diffraction",
+        choices=DIFFRACTION_TYPES,
+        default=None,
+        help="diffraction operator: exact angular spectrum (full), KZK (parabolic) or a Pade approximant of the "
+        "exact one (pade) (overrides Solver.DiffractSolver.Type; default full)",
+    )
+    p.add_argument(
+        "--pade-order",
+        type=int,
+        choices=PADE_ORDERS,
+        default=None,
+        help="order m of the [m/m] Pade operator; implies --diffraction pade (overrides "
+        "Solver.DiffractSolver.PadeOrder; default 1)",
+    )
     return p
 
 
@@ -53,7 +70,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         opts = Options.load(args.options) if args.options is not None else Options({})
         results = simulate(
-            opts, workers=max(1, args.nthreads), progress_bar=args.progress_bar, precision=args.precision
+            opts,
+            workers=max(1, args.nthreads),
+            progress_bar=args.progress_bar,
+            precision=args.precision,
+            diffraction=args.diffraction,
+            pade_order=args.pade_order,
         )
     except (OSError, TypeError, ValueError) as err:
         print(f"pywave3d: error: {err}", file=sys.stderr)

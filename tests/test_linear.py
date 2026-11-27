@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 import pywave3d as pw
+from pywave3d.linear import pade_coefficients, pade_sqrt, pade_sqrt_derivative
 
 F0 = 1e6
 
@@ -123,22 +124,78 @@ def test_pml_leaves_a_plane_wave_alone(small_grid: pw.Grid, water: pw.Medium) ->
     np.testing.assert_allclose(f, 1.0, atol=1e-12)
 
 
-@pytest.mark.parametrize("paraxial", [False, True])
-def test_pml_decay_of_a_transverse_mode(small_grid: pw.Grid, water: pw.Medium, paraxial: bool) -> None:
-    """At the outer edge (sigma = strength) a mode (kx, 0) decays by exp(-sigma kx^2 dz / (k kz))."""
+@pytest.mark.parametrize("operator", ["exact", "paraxial", "pade1", "pade2", "pade3"])
+def test_pml_decay_of_a_transverse_mode(small_grid: pw.Grid, water: pw.Medium, operator: str) -> None:
+    """At the outer edge (sigma = strength) a mode (kx, 0) decays by exp(-sigma kx^2 dz / (k kz)),
+    kz being -k / (2 R'(X)) for the operator R used: sqrt(k^2 - kx^2) exact, k paraxial."""
+    paraxial = operator == "paraxial"
+    order = int(operator[-1]) if operator.startswith("pade") else 0
     pml = pw.AbsorbingLayer(width=2e-3, strength=500.0, kind="pml", levels=3)
-    lin = pw.LinearPropagator(small_grid, water, F0, absorption=False, paraxial=paraxial, layer=pml)
-    free = pw.LinearPropagator(small_grid, water, F0, absorption=False, paraxial=paraxial)
+    lin = pw.LinearPropagator(small_grid, water, F0, absorption=False, paraxial=paraxial, pade_order=order, layer=pml)
+    free = pw.LinearPropagator(small_grid, water, F0, absorption=False, paraxial=paraxial, pade_order=order)
     f = mode(small_grid, 3, 0, 1)
     g = f.copy()
     lin.apply(f, 0.5)
     free.apply(g, 0.5)
     k = 2 * np.pi * F0 / water.sound_speed
     kx = small_grid.kx[3]
-    kz = k if paraxial else np.sqrt(k**2 - kx**2)
+    if paraxial:
+        kz = k
+    elif order:
+        kz = -k / (2 * float(pade_sqrt_derivative(np.array(kx**2 / k**2), order)))
+    else:
+        kz = np.sqrt(k**2 - kx**2)
     expected = np.exp(-500.0 * kx**2 / (k * kz) * small_grid.dz / 2)
     np.testing.assert_allclose(f[0, 0] / g[0, 0], expected, rtol=1e-10)  # x = x0: the edge
     np.testing.assert_allclose(f[0, 16], g[0, 16], rtol=1e-12)  # outside the layer: untouched
+
+
+def test_pade_approximants_of_the_square_root() -> None:
+    """R_m matches sqrt(1 - X) to order X^(2m); m = 1 is (1 - 3X/4) / (1 - X/4); R_m' is the
+    derivative of R_m; orders other than 1, 2, 3 are refused."""
+    x = np.array([1e-2, 2e-2])
+    np.testing.assert_allclose(pade_sqrt(x, 1), (1 - 0.75 * x) / (1 - 0.25 * x), rtol=1e-15)
+    for m in (1, 2):  # (m = 3 is at round-off for these X)
+        err = np.abs(pade_sqrt(x, m) - np.sqrt(1 - x))
+        assert np.log2(err[1] / err[0]) == pytest.approx(2 * m + 1, abs=0.05)
+    wide = np.linspace(0, 1, 11)
+    errors = [np.abs(pade_sqrt(wide, m) - np.sqrt(1 - wide))[:-1].max() for m in (1, 2, 3)]
+    assert errors[0] > errors[1] > errors[2]
+    h = 1e-6
+    for m in (1, 2, 3):
+        a, b = pade_coefficients(m)
+        assert a.shape == b.shape == (m,)
+        numeric = (pade_sqrt(wide[:-1] + h, m) - pade_sqrt(wide[:-1] - h, m)) / (2 * h)
+        np.testing.assert_allclose(pade_sqrt_derivative(wide[:-1], m), numeric, rtol=1e-7)
+        assert np.all(pade_sqrt_derivative(wide, m) < 0)
+    for bad in (0, 4):
+        with pytest.raises(ValueError):
+            pade_coefficients(bad)
+
+
+@pytest.mark.parametrize("order", [1, 2, 3])
+def test_pade_phase_and_evanescent_decay(small_grid: pw.Grid, water: pw.Medium, order: int) -> None:
+    """A propagating mode turns by exp(-i k (R(X) - 1) dz) at unit modulus; an evanescent one
+    decays exactly as with the exact operator."""
+    lin = pw.LinearPropagator(small_grid, water, F0, absorption=False, pade_order=order)
+    f = mode(small_grid, 2, 1, small_grid.n_harmonics)
+    f0 = f.copy()
+    lin.apply(f)
+    k = 2 * np.pi * F0 / water.sound_speed
+    x = (small_grid.kx[2] ** 2 + small_grid.ky[1] ** 2) / k**2
+    expected = np.exp(-1j * k * (float(pade_sqrt(np.array(x), order)) - 1) * small_grid.dz)
+    np.testing.assert_allclose(f[0], f0[0] * expected, rtol=1e-10, atol=1e-12)
+    g = pw.Grid(nx=16, ny=16, nz=5, nt=2, dx=2e-4, dy=2e-4, dz=2e-4)  # kx up to 8 k
+    e = mode(g, 6, 0, 1)
+    pw.LinearPropagator(g, water, F0, absorption=False, pade_order=order).apply(e)
+    np.testing.assert_allclose(np.abs(e[0]), np.exp(-np.sqrt(g.kx[6] ** 2 - k**2) * g.dz), rtol=1e-10)
+
+
+def test_pade_order_is_checked(small_grid: pw.Grid, water: pw.Medium) -> None:
+    with pytest.raises(ValueError, match="pade_order"):
+        pw.LinearPropagator(small_grid, water, F0, pade_order=4)
+    with pytest.raises(ValueError, match="paraxial or a Pade"):
+        pw.LinearPropagator(small_grid, water, F0, paraxial=True, pade_order=2)
 
 
 def test_pml_without_diffraction_does_nothing(small_grid: pw.Grid, water: pw.Medium) -> None:

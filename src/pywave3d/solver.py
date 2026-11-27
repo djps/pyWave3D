@@ -16,7 +16,7 @@ The ``Solver`` section of the options file selects the parts and the outputs::
     "Solver": {
       "Options": {"Diff": true, "NLN": true, "Adsorp": true, "AbsorbingBC": false},
       "DiffractSolver": {"NumberOfPointsPerWaveLength": 6, "SamplingFrequencyMultiplier": 32,
-                         "Type": "full"},
+                         "Type": "full", "PadeOrder": 1},
       "NonlinearSolver": {"method": "auto", "switch_threshold": 1e-3,
                           "amplitude_threshold": 1e-4, "cfl": 0.5},
       "ShockSmoothing": {"enabled": true, "type": "axial", "peak_multiplier": 5,
@@ -31,6 +31,11 @@ The ``Solver`` section of the options file selects the parts and the outputs::
     }
 
 All switches default to on except the absorbing layer: nonlinear propagation with absorption.
+
+``DiffractSolver.Type`` is the diffraction operator: ``"full"`` (the exact one-way angular
+spectrum, the default), ``"parabolic"`` (KZK) or ``"pade"``, the [m/m] Pade approximant of the
+exact operator with m = ``PadeOrder`` (1, 2 or 3; default 1), the wide-angle parabolic equation
+of that order (see :mod:`pywave3d.linear`). ``PadeOrder`` goes with ``"pade"`` only.
 
 ``ShockSmoothing`` adds artificial absorption against the oscillations that shocks cause. It
 is on when the block is present, unless ``enabled`` is false. ``type`` chooses how:
@@ -59,7 +64,7 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 
 from pywave3d._types import ComplexArray
 from pywave3d.grid import Grid
-from pywave3d.linear import AxialSmoothing, LinearPropagator
+from pywave3d.linear import PADE_ORDERS, AxialSmoothing, LinearPropagator
 from pywave3d.model import WaveModel
 from pywave3d.nonlinear import AdaptiveSmoothing, NonlinearMethod, NonlinearOperator
 from pywave3d.options import Options
@@ -67,6 +72,12 @@ from pywave3d.recorder import PlaneRecorder, RecordSettings
 from pywave3d.results import FocalQuantity, Results
 
 log = logging.getLogger(__name__)
+
+#: the diffraction operators of ``DiffractSolver.Type`` (and their aliases)
+DiffractionType = Literal["full", "parabolic", "pade"]
+DIFFRACTION_TYPES: tuple[DiffractionType, ...] = ("full", "parabolic", "pade")
+_DIFFRACTION_ALIASES = {"full": "full", "helmholtz": "full", "parabolic": "parabolic", "paraxial": "parabolic",
+                        "kzk": "parabolic", "pade": "pade", "wide-angle": "pade"}  # fmt: skip
 
 #: precision of the march: complex128 (double) or complex64 (single) fields
 Precision = Literal["single", "double"]
@@ -80,6 +91,8 @@ class SolverSettings:
     Attributes:
         diffraction, nonlinearity, absorption, absorbing_layer: the parts of the model.
         paraxial: use the parabolic (KZK) diffraction operator instead of the exact one.
+        pade_order: 1, 2 or 3 to use the [m/m] Pade approximant of the exact diffraction
+            operator (wide-angle parabolic equation) instead of it; 0 (default) for none.
         method, switch_threshold, amplitude_threshold, cfl: see :class:`NonlinearOperator`.
         harmonic_tolerance: harmonics below this fraction of the fundamental's maximum are
             treated as zero (and not transformed) until the nonlinearity fills them. It is
@@ -109,6 +122,7 @@ class SolverSettings:
     absorption: bool = True
     absorbing_layer: bool = False
     paraxial: bool = False
+    pade_order: int = 0
     method: NonlinearMethod = "auto"
     switch_threshold: float = 1e-3
     amplitude_threshold: float = 1e-4
@@ -137,9 +151,17 @@ class SolverSettings:
         if absorption is None:
             absorption = sw.get("Absorp", bool, d.absorption)
         diff = opts.child("DiffractSolver")
-        eq = diff.get("Type", str, "full").lower()
-        if eq not in ("full", "helmholtz", "parabolic", "paraxial", "kzk"):
-            raise TypeError(f"options: '{diff.path}.Type' should be 'full' or 'parabolic', not {eq!r}")
+        name = diff.get("Type", str, "full").lower()
+        eq = _DIFFRACTION_ALIASES.get(name)
+        if eq is None:
+            raise TypeError(f"options: '{diff.path}.Type' should be 'full', 'parabolic' or 'pade', not {name!r}")
+        pade_order = 0
+        if eq == "pade":
+            pade_order = diff.get("PadeOrder", int, 1)
+            if pade_order not in PADE_ORDERS:
+                raise TypeError(f"options: '{diff.path}.PadeOrder' should be one of {PADE_ORDERS}, not {pade_order}")
+        elif diff.get("PadeOrder", int, None) is not None:
+            raise TypeError(f"options: '{diff.path}.PadeOrder' needs '\"Type\": \"pade\"' (the Type is {name!r})")
         nl = opts.child("NonlinearSolver")
         met = opts.child("Metrics")
         out = opts.child("Output")
@@ -174,7 +196,8 @@ class SolverSettings:
             nonlinearity=sw.get("NLN", bool, d.nonlinearity),
             absorption=absorption,
             absorbing_layer=sw.get("AbsorbingBC", bool, d.absorbing_layer),
-            paraxial=eq in ("parabolic", "paraxial", "kzk"),
+            paraxial=eq == "parabolic",
+            pade_order=pade_order,
             method=nl.get("method", str, d.method).lower(),  # type: ignore[arg-type]
             switch_threshold=nl.get("switch_threshold", float, d.switch_threshold),
             amplitude_threshold=nl.get("amplitude_threshold", float, d.amplitude_threshold),
@@ -193,6 +216,28 @@ class SolverSettings:
             workers=workers,
             shock_smoothing=smoothing,
         )
+
+
+def with_diffraction(
+    settings: SolverSettings, diffraction: DiffractionType | None, pade_order: int | None
+) -> SolverSettings:
+    """``settings`` with the diffraction operator set (see :func:`simulate`)."""
+    if diffraction is None:
+        diffraction = "pade" if pade_order is not None else _current_type(settings)
+    if diffraction not in DIFFRACTION_TYPES:
+        raise ValueError(f"diffraction should be one of {DIFFRACTION_TYPES}, not {diffraction!r}")
+    if diffraction != "pade" and pade_order is not None:
+        raise ValueError(f"a Pade order needs the 'pade' diffraction operator, not {diffraction!r}")
+    order = 0
+    if diffraction == "pade":
+        order = pade_order if pade_order is not None else (settings.pade_order or 1)
+        if order not in PADE_ORDERS:
+            raise ValueError(f"the Pade order should be one of {PADE_ORDERS}, not {order!r}")
+    return dataclasses.replace(settings, paraxial=diffraction == "parabolic", pade_order=order)
+
+
+def _current_type(settings: SolverSettings) -> DiffractionType:
+    return "parabolic" if settings.paraxial else "pade" if settings.pade_order else "full"
 
 
 def read_precision(opts: Options) -> bool:
@@ -237,6 +282,7 @@ class WaveSolver:
             diffraction=s.diffraction,
             absorption=s.absorption,
             paraxial=s.paraxial,
+            pade_order=s.pade_order,
             layer=model.layer if s.absorbing_layer else None,
             dtype=self.dtype,
             workers=s.workers,
@@ -264,6 +310,20 @@ class WaveSolver:
         self.harmonic_tolerance = max(s.harmonic_tolerance, 16 * float(np.finfo(self.dtype).eps))
         self.field: ComplexArray = model.initial_field(self.grid, self.dtype)
         self.n_active = self._active_harmonics()
+
+    @property
+    def diffraction_operator(self) -> str:
+        """A description of the diffraction operator in use, for logs and reports."""
+        s = self.settings
+        if not s.diffraction:
+            return "off"
+        if s.paraxial:
+            return "paraxial (KZK)"
+        if s.pade_order:
+            return (
+                f"Pade [{s.pade_order}/{s.pade_order}] (wide-angle, order {s.pade_order}) on the propagating components"
+            )
+        return "exact (one-way angular spectrum, non-paraxial)"
 
     def _active_harmonics(self) -> int:
         """Number of leading harmonics with energy (the rest are zero)."""
@@ -335,6 +395,7 @@ class WaveSolver:
             timings["record"] += time.perf_counter() - t0
 
         log.info("Grid: %s", g.summary())
+        log.info("Diffraction operator: %s", self.diffraction_operator)
         log.info(
             "Model: diffraction %s, nonlinearity %s, absorption %s, absorbing layer %s; %s precision (%s)",
             *(
@@ -453,6 +514,8 @@ def simulate(
     workers: int = 1,
     progress_bar: bool | None = None,
     precision: Precision | None = None,
+    diffraction: DiffractionType | None = None,
+    pade_order: int | None = None,
 ) -> Results:
     """Run a simulation from an options file (or node), or the water default if None.
 
@@ -464,6 +527,10 @@ def simulate(
             (``Solver.Output.progress_bar``, default true).
         precision: ``"single"`` or ``"double"`` for the march; None takes it from the options
             (``Solver.precision``, default double).
+        diffraction: ``"full"``, ``"parabolic"`` or ``"pade"``; None takes it from the options
+            (``Solver.DiffractSolver.Type``, default full).
+        pade_order: the order of the Pade operator (1, 2 or 3). It implies ``"pade"`` when
+            ``diffraction`` is None; None takes it from the options (default 1).
     """
     if options is None:
         opts = Options({})
@@ -481,4 +548,6 @@ def simulate(
         if precision not in PRECISIONS:
             raise ValueError(f"precision should be 'single' or 'double', not {precision!r}")
         settings.single_precision = precision == "single"
+    if diffraction is not None or pade_order is not None:
+        settings = with_diffraction(settings, diffraction, pade_order)
     return WaveSolver(model, grid, settings).run()

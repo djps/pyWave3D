@@ -10,7 +10,17 @@ a plane-wave component (kx, ky) of harmonic n, with k_n = n omega / c0, evolves 
 
 where alpha_n is the absorption and dk_n the Kramers-Kronig dispersion of the medium. This is
 the exact one-way (angular spectrum) propagator; ``paraxial=True`` replaces kz_n - k_n by
--(kx^2 + ky^2) / (2 k_n), the KZK (parabolic) approximation. Absorption does not depend on
+-(kx^2 + ky^2) / (2 k_n), the KZK (parabolic) approximation, and ``pade_order=m`` by
+k_n (R_m(X) - 1), X = (kx^2 + ky^2) / k_n^2, with R_m the [m/m] Pade approximant of sqrt(1 - X)
+(the wide-angle parabolic equations; Bamberger et al. 1988, Collins 1993):
+
+    R_m(X) = 1 - sum_{j=1..m} a_j X / (1 - b_j X),
+    a_j = 2 sin^2(j pi / (2m + 1)) / (2m + 1),   b_j = cos^2(j pi / (2m + 1)).
+
+R_m matches sqrt(1 - X) to order X^(2m): m = 1 is (1 - 3X/4) / (1 - X/4), the 45-degree
+equation, and the paraxial operator is the [1/0] approximant 1 - X/2. A Pade approximant is real
+and has poles for X > 1, where the exact operator is evanescent: there the evanescent decay is
+kept exactly, so the approximation acts on the propagating components only. Absorption does not depend on
 (x, y), so it commutes with diffraction and both are applied with one pair of 2D FFTs.
 
 The transverse plane is periodic. Against wrap-around an :class:`AbsorbingLayer` can be placed
@@ -22,12 +32,14 @@ per unit z it decays at
 
     gamma_n = sigma_x(x) kx^2 / (k_n kz_n) + sigma_y(y) ky^2 / (k_n kz_n)
 
-(kz_n -> k_n in the paraxial case). Unlike the sponge it acts on the lateral component of the
-motion only: a wave heading out through the side is absorbed, a wave running along z next to
-the edge is almost untouched. Because gamma depends on both position and wavenumber, the
-symbol exp(-gamma dz) is applied at ``levels`` reference values of sigma and the fields are
-interpolated linearly in sigma at each point (phase shift plus interpolation, Gazdag and
-Sguazzero 1984). Each level is a contraction and the weights are convex, so the step is stable.
+(kz_n -> k_n in the paraxial case; for a Pade operator kz_n -> -k_n / (2 R_m'(X)), from
+d kz_n / d(kx^2) of the operator used, which reduces to the two others). Unlike the sponge it
+acts on the lateral component of the motion only: a wave heading out through the side is
+absorbed, a wave running along z next to the edge is almost untouched. Because gamma depends on
+both position and wavenumber, the symbol exp(-gamma dz) is applied at ``levels`` reference values
+of sigma and the fields are interpolated linearly in sigma at each point (phase shift plus
+interpolation, Gazdag and Sguazzero 1984). Each level is a contraction and the weights are
+convex, so the step is stable.
 """
 
 from __future__ import annotations
@@ -204,6 +216,33 @@ class AxialSmoothing:
         return total
 
 
+#: orders of the Pade approximants of the diffraction operator
+PADE_ORDERS = (1, 2, 3)
+
+
+def pade_coefficients(order: int) -> tuple[RealArray, RealArray]:
+    """The (a_j, b_j), j = 1 .. order, of the [order/order] Pade approximant of sqrt(1 - X),
+    R(X) = 1 - sum_j a_j X / (1 - b_j X) (see the module docstring)."""
+    if order not in PADE_ORDERS:
+        raise ValueError(f"Pade order must be one of {PADE_ORDERS}, not {order!r}")
+    theta = np.arange(1, order + 1) * np.pi / (2 * order + 1)
+    return 2 * np.sin(theta) ** 2 / (2 * order + 1), np.cos(theta) ** 2
+
+
+def pade_sqrt(x: RealArray, order: int) -> RealArray:
+    """R(X), the [order/order] Pade approximant of sqrt(1 - X), for X <= 1."""
+    a, b = pade_coefficients(order)
+    x = np.asarray(x, dtype=float)
+    return np.asarray(1.0 - sum(aj * x / (1.0 - bj * x) for aj, bj in zip(a, b, strict=True)), dtype=float)
+
+
+def pade_sqrt_derivative(x: RealArray, order: int) -> RealArray:
+    """dR/dX of :func:`pade_sqrt` (negative for X <= 1)."""
+    a, b = pade_coefficients(order)
+    x = np.asarray(x, dtype=float)
+    return np.asarray(-sum(aj / (1.0 - bj * x) ** 2 for aj, bj in zip(a, b, strict=True)), dtype=float)
+
+
 class _PML:
     """The PML symbol at reference levels of sigma, for one step fraction.
 
@@ -248,6 +287,9 @@ class LinearPropagator:
         diffraction: include diffraction (False leaves only absorption, applied without FFTs).
         absorption: include absorption and dispersion.
         paraxial: use the parabolic (KZK) approximation of the propagator.
+        pade_order: 1, 2 or 3 to use the [m/m] Pade approximant of the propagator (the
+            wide-angle parabolic equation of that order) on the propagating components; 0 for
+            the exact one. Not with ``paraxial``.
         layer: optional absorbing boundary layer (sponge or PML). The PML needs diffraction:
             without it nothing moves sideways and the layer does nothing.
         dtype: complex dtype of the field.
@@ -266,13 +308,20 @@ class LinearPropagator:
         diffraction: bool = True,
         absorption: bool = True,
         paraxial: bool = False,
+        pade_order: int = 0,
         layer: AbsorbingLayer | None = None,
         dtype: type[np.complexfloating] = np.complex128,
         workers: int = 1,
         smoothing: AxialSmoothing | None = None,
     ) -> None:
+        if pade_order and pade_order not in PADE_ORDERS:
+            raise ValueError(f"pade_order must be 0 (exact) or one of {PADE_ORDERS}, not {pade_order!r}")
+        if pade_order and paraxial:
+            raise ValueError("the diffraction operator is either paraxial or a Pade approximant, not both")
         self.grid = grid
         self.diffraction = diffraction
+        self.paraxial = paraxial
+        self.pade_order = pade_order
         self.workers = workers
         n = np.arange(1, grid.n_harmonics + 1, dtype=float)
         kn = 2 * np.pi * frequency * n / medium.sound_speed  # (K,)
@@ -316,7 +365,15 @@ class LinearPropagator:
                 if pml:
                     # kz_n, kept away from 0 so that grazing and evanescent components are
                     # absorbed strongly but finitely
-                    kz = kn_i * np.ones_like(kt2) if paraxial else np.sqrt(np.clip(k2 - kt2, 0.0, None))
+                    if paraxial:
+                        kz = kn_i * np.ones_like(kt2)
+                    elif pade_order:
+                        # -k / (2 R'(X)) where the Pade operator acts, the exact 0 (floored
+                        # below) for the evanescent components
+                        x = kt2 / k2
+                        kz = np.where(x <= 1, -kn_i / (2 * pade_sqrt_derivative(np.minimum(x, 1.0), pade_order)), 0.0)
+                    else:
+                        kz = np.sqrt(np.clip(k2 - kt2, 0.0, None))
                     kz = np.maximum(kz, 1e-2 * kn_i)
                     q = (
                         (grid.kx[:, None] ** 2 / (kn_i * kz)).astype(real),
@@ -328,6 +385,12 @@ class LinearPropagator:
                 if paraxial:
                     phase = -kt2 / (2 * kn_i)  # kz - k
                     exponent = -1j * phase
+                elif pade_order:
+                    x = kt2 / k2
+                    kzc = np.sqrt((k2 - kt2).astype(complex))
+                    # kz - k = k (R(X) - 1) where X <= 1; the exact decay of the evanescent ones
+                    phase = kn_i * (pade_sqrt(np.minimum(x, 1.0), pade_order) - 1.0)
+                    exponent = np.where(x <= 1, -1j * phase, -np.abs(kzc) + 1j * kn_i)
                 else:
                     kzc = np.sqrt((k2 - kt2).astype(complex))
                     # propagating: kz real >= 0; evanescent: kz = +i |.| -> exp(-|.| dz) decays

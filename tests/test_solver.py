@@ -212,7 +212,7 @@ def test_cli_progress_flag(monkeypatch) -> None:
 
     seen = []
 
-    def fake_simulate(opts, workers, progress_bar, precision=None):
+    def fake_simulate(opts, workers, progress_bar, **overrides):
         seen.append(progress_bar)
         raise ValueError("stop here")  # main reports it and returns 1
 
@@ -364,3 +364,72 @@ def test_single_precision_does_not_activate_harmonics_on_rounding_noise() -> Non
     # harmonics than double, whose tolerance (1e-10) is lower
     assert len(active[True]) == len(active[False])
     assert np.all(np.asarray(active[True]) <= np.asarray(active[False]))
+
+
+def test_pade_operators_approach_the_exact_one() -> None:
+    """A strongly focused beam (F-number ~0.9, half-angle ~35 degrees): the axis of the exact
+    operator is approached as the Pade order rises, and every Pade order beats the paraxial one."""
+    model = focused_model(radius=7e-3, depth=12e-3, lx=24e-3, lz=16e-3)
+    grid = model.make_grid(Options({"NumberOfPointsPerWaveLength": 4, "SamplingFrequencyMultiplier": 2}))
+    base = {"nonlinearity": False, "absorption": False, "progress_bar": False}
+    exact = np.abs(pw.WaveSolver(model, grid, pw.SolverSettings(**base)).run().axis[:, 0])
+    beyond = slice(int(0.15 * exact.size), None)  # clear of the evanescent near field
+
+    def error(**kw) -> float:
+        a = np.abs(pw.WaveSolver(model, grid, pw.SolverSettings(**base, **kw)).run().axis[:, 0])
+        return float(np.max(np.abs(a - exact)[beyond]) / exact.max())
+
+    paraxial = error(paraxial=True)
+    pade = [error(pade_order=m) for m in (1, 2, 3)]
+    assert paraxial > pade[0] > pade[1] > pade[2]
+    assert pade[2] < 0.03 and pade[0] < 0.5 * paraxial
+
+
+def test_diffraction_from_options_cli_and_simulate(monkeypatch, tmp_path) -> None:
+    def read(diff):
+        s = pw.SolverSettings.from_options(Options({"DiffractSolver": diff}))
+        return s.paraxial, s.pade_order
+
+    assert read({}) == (False, 0)
+    assert read({"Type": "pade"}) == (False, 1)
+    assert read({"Type": "Pade", "PadeOrder": 3}) == (False, 3)
+    assert read({"Type": "wide-angle", "PadeOrder": 2}) == (False, 2)
+    assert read({"Type": "parabolic"}) == (True, 0)
+    for bad in ({"Type": "pade", "PadeOrder": 4}, {"Type": "pade", "PadeOrder": 0}, {"PadeOrder": 2}, {"Type": "x"}):
+        with pytest.raises(TypeError):
+            read(bad)
+
+    used: list[tuple[bool, int]] = []
+    run = pw.WaveSolver.run
+
+    def spy(self):
+        used.append((self.settings.paraxial, self.settings.pade_order))
+        assert self.linear.pade_order == self.settings.pade_order
+        return run(self)
+
+    monkeypatch.setattr(pw.WaveSolver, "run", spy)
+    opts = {
+        "Model": {"Geometry": {"lx": 0.008, "ly": 0.008, "lz": 0.004},
+                  "Transducer": {"outer_radius": 0.002, "focusing_depth": 0.01, "power": 1}},
+        "Solver": {"DiffractSolver": {"NumberOfPointsPerWaveLength": 3, "SamplingFrequencyMultiplier": 4,
+                                      "Type": "pade", "PadeOrder": 2}},
+    }  # fmt: skip
+    f = tmp_path / "o.json"
+    f.write_text(json.dumps(opts))
+    out = ["-o", str(tmp_path / "out"), "-q", "--no-progress"]
+    assert main(["1", str(f), *out]) == 0  # the file: Pade 2
+    assert main(["1", str(f), *out, "--pade-order", "3"]) == 0  # the order from the flag
+    assert main(["1", str(f), *out, "--diffraction", "pade"]) == 0  # the order from the file
+    assert main(["1", str(f), *out, "--diffraction", "full"]) == 0
+    assert main(["1", str(f), *out, "--diffraction", "parabolic"]) == 0
+    assert main(["1", str(f), *out, "--diffraction", "full", "--pade-order", "2"]) == 1  # contradictory
+    opts["Solver"]["DiffractSolver"].pop("Type")
+    opts["Solver"]["DiffractSolver"].pop("PadeOrder")
+    f.write_text(json.dumps(opts))
+    assert main(["1", str(f), *out, "--pade-order", "1"]) == 0  # implies pade
+    assert main(["1", str(f), *out, "--diffraction", "pade"]) == 0  # default order 1
+    assert used == [(False, 2), (False, 3), (False, 2), (False, 0), (True, 0), (False, 1), (False, 1)]
+    with pytest.raises(SystemExit):
+        main(["1", str(f), "--pade-order", "4"])
+    with pytest.raises(SystemExit):
+        main(["1", str(f), "--diffraction", "kirchhoff"])
