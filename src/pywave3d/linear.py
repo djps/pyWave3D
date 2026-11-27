@@ -211,13 +211,17 @@ class _PML:
     multiplies the spectrum by ``decay_d ** j``, decay_d = exp(-f dz (strength/levels) q_d),
     q_x = kx^2 / (k_n kz_n). At a point with sigma_d between two levels the two fields are
     blended linearly.
+
+    ``decay`` holds the two decays, each (K, nx, ny), already at the field's real precision
+    (:class:`LinearPropagator` fills them one harmonic at a time); the weights are made at the
+    same precision, so that a single-precision march has no double-precision temporaries in the
+    layer.
     """
 
-    def __init__(
-        self, q: list[RealArray], sigma: tuple[RealArray, RealArray], layer: AbsorbingLayer, dz: float
-    ) -> None:
+    def __init__(self, decay: list[RealArray], sigma: tuple[RealArray, RealArray], layer: AbsorbingLayer) -> None:
         step = layer.strength / layer.levels
-        self.decay = [np.exp(-dz * step * qd) for qd in q]  # each (K, nx, ny)
+        real = decay[0].dtype
+        self.decay = decay
         self.levels = layer.levels
         # interpolation weights: (levels + 1, nx, 1) for x and (levels + 1, 1, ny) for y
         self.weights = []
@@ -227,7 +231,7 @@ class _PML:
             j = np.arange(self.levels + 1)[:, None]
             w = np.clip(1 - np.abs(pos[None, :] - j), 0.0, None)
             shape = (self.levels + 1, -1, 1) if d == 0 else (self.levels + 1, 1, -1)
-            self.weights.append(w.reshape(shape))
+            self.weights.append(w.reshape(shape).astype(real))
             self.rows.append(np.flatnonzero(sig > 0))
 
 
@@ -291,32 +295,51 @@ class LinearPropagator:
         real = np.finfo(dtype).dtype
 
         if diffraction:
-            kt2 = (grid.kx[:, None] ** 2 + grid.ky[None, :] ** 2)[None, :, :]  # (1, nx, ny)
-            k2 = kn[:, None, None] ** 2
-            if layer is not None and layer.kind == "pml" and layer.active:
-                sigma = layer.profiles(grid)
-                assert sigma is not None
-                # kz_n, kept away from 0 so that grazing and evanescent components are
-                # absorbed strongly but finitely
-                kz = kn[:, None, None] * np.ones_like(kt2) if paraxial else np.sqrt(np.clip(k2 - kt2, 0.0, None))
-                kz = np.maximum(kz, 1e-2 * kn[:, None, None])
-                q = [
-                    (grid.kx[None, :, None] ** 2 / (kn[:, None, None] * kz)).astype(real),
-                    (grid.ky[None, None, :] ** 2 / (kn[:, None, None] * kz)).astype(real),
-                ]
-                self._pml_full = _PML(q, sigma, layer, grid.dz)
-                self._pml_half = _PML(q, sigma, layer, grid.dz / 2)
-            if paraxial:
-                phase = -kt2 / (2 * kn[:, None, None])  # kz - k
-                exponent = -1j * phase
-            else:
-                kz = np.sqrt((k2 - kt2).astype(complex))
-                # propagating: kz real >= 0; evanescent: kz = +i |.| -> exp(-|.| dz) decays
-                exponent = -1j * (kz - kn[:, None, None])
-                exponent = np.where(k2 >= kt2, exponent, -np.abs(kz) + 1j * kn[:, None, None])
-            exponent = exponent - loss[:, None, None]
-            self._full = np.exp(exponent * grid.dz).astype(dtype)
-            self._half = np.exp(exponent * (grid.dz / 2)).astype(dtype)
+            # the operators are computed in double precision one harmonic at a time and stored
+            # at the field's precision: the temporaries are (nx, ny), not (K, nx, ny), so the
+            # set-up never holds more than the stored operators (and single precision halves them)
+            k = grid.n_harmonics
+            shape = (k, grid.nx, grid.ny)
+            kt2 = grid.kx[:, None] ** 2 + grid.ky[None, :] ** 2  # (nx, ny)
+            self._full = np.empty(shape, dtype=dtype)
+            self._half = np.empty(shape, dtype=dtype)
+            pml = layer is not None and layer.kind == "pml" and layer.active
+            sigma = layer.profiles(grid) if pml and layer is not None else None
+            if pml:
+                assert layer is not None and sigma is not None
+                step = layer.strength / layer.levels
+                decay_full = [np.empty(shape, dtype=real) for _ in range(2)]
+                decay_half = [np.empty(shape, dtype=real) for _ in range(2)]
+            for i in range(k):
+                kn_i = kn[i]
+                k2 = kn_i**2
+                if pml:
+                    # kz_n, kept away from 0 so that grazing and evanescent components are
+                    # absorbed strongly but finitely
+                    kz = kn_i * np.ones_like(kt2) if paraxial else np.sqrt(np.clip(k2 - kt2, 0.0, None))
+                    kz = np.maximum(kz, 1e-2 * kn_i)
+                    q = (
+                        (grid.kx[:, None] ** 2 / (kn_i * kz)).astype(real),
+                        (grid.ky[None, :] ** 2 / (kn_i * kz)).astype(real),
+                    )
+                    for d in range(2):
+                        decay_full[d][i] = np.exp(-grid.dz * step * q[d])
+                        decay_half[d][i] = np.exp(-(grid.dz / 2) * step * q[d])
+                if paraxial:
+                    phase = -kt2 / (2 * kn_i)  # kz - k
+                    exponent = -1j * phase
+                else:
+                    kzc = np.sqrt((k2 - kt2).astype(complex))
+                    # propagating: kz real >= 0; evanescent: kz = +i |.| -> exp(-|.| dz) decays
+                    exponent = -1j * (kzc - kn_i)
+                    exponent = np.where(k2 >= kt2, exponent, -np.abs(kzc) + 1j * kn_i)
+                exponent = exponent - loss[i]
+                self._full[i] = np.exp(exponent * grid.dz)
+                self._half[i] = np.exp(exponent * (grid.dz / 2))
+            if pml:
+                assert layer is not None and sigma is not None
+                self._pml_full = _PML(decay_full, sigma, layer)
+                self._pml_half = _PML(decay_half, sigma, layer)
         else:
             self._full = np.exp(-loss * grid.dz).astype(dtype)[:, None, None]
             self._half = np.exp(-loss * grid.dz / 2).astype(dtype)[:, None, None]

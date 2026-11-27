@@ -45,7 +45,7 @@ from typing import Literal
 import numpy as np
 import scipy.fft as sfft
 
-from pywave3d._types import ComplexArray, RealArray
+from pywave3d._types import ComplexArray, IntArray, RealArray
 from pywave3d.medium import Medium
 
 NonlinearMethod = Literal["auto", "spectral", "godunov"]
@@ -113,6 +113,130 @@ def harmonics_of(wave: RealArray, k: int, workers: int = 1, axis: int = 0) -> Co
     m = min(k, nt // 2)
     np.multiply(spec[1 : m + 1], 2 / nt, out=out[:m])
     return np.moveaxis(out, 0, axis)
+
+
+def peak_pressures(
+    harmonics: ComplexArray,
+    workers: int = 1,
+    iterations: int = 6,
+    chunk: int = 8192,
+    floor: tuple[RealArray | float, RealArray | float] | None = None,
+) -> tuple[RealArray, RealArray]:
+    """Peak positive and negative pressure (p+, p-) of the waveforms of harmonics (K, ...).
+
+    The waveform is sampled at 4 K points per period. The largest local maximum of the samples
+    (of -p for p-) is refined by Newton steps on the trigonometric series itself, kept within
+    one sample of where it started, where a local maximum of samples must have its peak; so is
+    the second largest wherever it could still come out on top. Sampling alone misses a peak
+    between samples by up to 1 - cos(pi / (4 K)) of the fundamental (29% for K = 1, 2% for
+    K = 4); refined, the error is at round-off for smooth waveforms. A refined value never falls
+    below the sampled one, so steep (shocked) waveforms are at least as accurate as the samples.
+
+    A sampled peak falls short of the true one by at most ``miss = (dphi^2 / 8) sum n^2 |P_n|``,
+    dphi = 2 pi / (4 K). With ``floor = (f_plus, f_minus)`` (numbers, or arrays of the shape of
+    the points), a point is refined only where its peak may exceed the floor: p+ where
+    ``sampled p+ + miss > f_plus``, p- where ``|sampled p-| + miss > f_minus``. Elsewhere the
+    sampled value is returned; it is then exact to within ``miss`` and known not to exceed
+    the floor, which is all that a running maximum or a plane extreme needs.
+
+    The points are taken ``chunk`` at a time, so the work arrays stay small whatever the plane.
+    The samples are at the precision of ``harmonics`` (the FFT of a single-precision march stays
+    single); the Newton steps are in double precision. Returns two float64 arrays of shape
+    ``harmonics.shape[1:]``.
+    """
+    h = np.asarray(harmonics)
+    k = h.shape[0]
+    rest = h.shape[1:]
+    flat = h.reshape(k, -1)
+    npts = flat.shape[1]
+    floors = [None, None] if floor is None else [np.broadcast_to(np.asarray(f, float), rest).ravel() for f in floor]
+    pp = np.empty(npts)
+    pm = np.empty(npts)
+    step = max(1, chunk)
+    for a in range(0, npts, step):
+        part = flat[:, a : a + step]
+        fl = [None if f is None else f[a : a + step] for f in floors]
+        pp[a : a + step], pm[a : a + step] = _refined_extremes(part, workers, iterations, fl[0], fl[1])
+    return pp.reshape(rest), pm.reshape(rest)
+
+
+def _refined_extremes(
+    flat: ComplexArray, workers: int, iterations: int, floor_plus: RealArray | None, floor_minus: RealArray | None
+) -> tuple[RealArray, RealArray]:
+    """(p+, p-) of the waveforms of harmonics ``flat`` (K, npts): see :func:`peak_pressures`."""
+    k = flat.shape[0]
+    nt = 4 * k
+    wave = waveform(flat, nt, workers).astype(np.float64, copy=False)  # (nt, npts)
+    flat = flat.astype(np.complex128, copy=False)
+    n = np.arange(1, k + 1, dtype=float)
+    # a sampled maximum is within half a sample of a peak of the waveform, so it falls short of
+    # that peak by at most (sample / 2)^2 / 2 max|p''| <= (sample^2 / 8) sum n^2 |P_n|
+    sample = 2 * np.pi / nt  # one sample, in omega tau
+    miss = (sample**2 / 8) * ((n * n) @ np.abs(flat))
+    plus = _extreme(flat, wave, miss, 1.0, floor_plus, iterations)
+    minus = _extreme(flat, wave, miss, -1.0, floor_minus, iterations)
+    return plus, minus
+
+
+def _extreme(
+    flat: ComplexArray, wave: RealArray, miss: RealArray, sign: float, floor: RealArray | None, iterations: int
+) -> RealArray:
+    """The largest of ``sign * p`` at each point (times ``sign``), refined where it may exceed
+    ``floor``; ``wave`` holds the 4 K samples of each waveform (module-level helpers of
+    :func:`peak_pressures`, so that beartype decorates them once and not at every call)."""
+    nt, npts = wave.shape
+    s = sign * wave
+    j1 = np.argmax(s, axis=0)  # the largest sample: a local maximum
+    best = s[j1, np.arange(npts)]  # the sampled peak: a lower bound, within miss of the true one
+    todo = np.arange(npts) if floor is None else np.flatnonzero(best + miss > floor)
+    if not todo.size:
+        return sign * best
+    best[todo] = _refine(flat[:, todo], j1[todo], s[:, todo], sign, iterations)
+    if nt > 2:
+        # the second largest local maximum of the samples can only win where its peak may rise
+        # above the refined first (looked for at the refined points only)
+        st = s[:, todo]
+        cols = np.arange(todo.size)
+        local = (st >= np.roll(st, 1, axis=0)) & (st >= np.roll(st, -1, axis=0))
+        ranked = np.where(local, st, -np.inf)
+        ranked[j1[todo], cols] = -np.inf
+        j2 = np.argmax(ranked, axis=0)
+        second = ranked[j2, cols]
+        near = np.flatnonzero(np.isfinite(second) & (second + miss[todo] > best[todo]))
+        if near.size:
+            close = todo[near]
+            again = _refine(flat[:, close], j2[near], s[:, close], sign, iterations)
+            best[close] = np.maximum(best[close], again)
+    return sign * best
+
+
+def _refine(flat: ComplexArray, j: IntArray, s: RealArray, sign: float, iterations: int) -> RealArray:
+    """Newton steps on ``sign * p`` from the samples ``j`` (one per point), each kept within one
+    sample of where it started; never below that sample."""
+    k = flat.shape[0]
+    nt = s.shape[0]
+    n = np.arange(1, k + 1, dtype=float)
+    n2 = n * n
+    sample = 2 * np.pi / nt
+    phi0 = sample * j
+    phi = phi0.copy()
+    for _ in range(iterations):
+        e = flat * _powers(phi, k)
+        d1 = -(n @ e.imag)  # d/dphi of Re sum P_n e^{i n phi}
+        d2 = -(n2 @ e.real)
+        ok = sign * d2 < 0  # curving the right way: a maximum of sign * p
+        step = np.where(ok, -d1 / np.where(d2 == 0, 1.0, d2), 0.0)
+        step = np.clip(step, -sample / 2, sample / 2)
+        phi = np.clip(phi + step, phi0 - sample, phi0 + sample)
+        if np.abs(step).max(initial=0.0) < 1e-10 * sample:
+            break
+    value = sign * (flat * _powers(phi, k)).real.sum(axis=0)
+    return np.maximum(value, s[j, np.arange(j.size)])
+
+
+def _powers(phi: RealArray, k: int) -> ComplexArray:
+    """exp(i n phi), n = 1 .. k, shape (k, npts): by a running product, not k exponentials."""
+    return np.cumprod(np.broadcast_to(np.exp(1j * phi), (k, phi.size)), axis=0)
 
 
 class NonlinearOperator:
@@ -248,7 +372,7 @@ class NonlinearOperator:
             rate = self.epsilon * self.omega * ka * pmax * dz
             nsub = max(1, math.ceil(rate / self.rk_safety))
             m = sfft.next_fast_len(3 * ka + 1, real=True)
-            coef = self._coef[:ka] * (2 / m)
+            coef = (self._coef[:ka] * (2 / m)).astype(q.dtype)  # at the march's precision
 
             def run(chunk: ComplexArray) -> None:
                 chunk[...] = self._spectral(chunk, dz, nsub, m, coef)
@@ -370,5 +494,6 @@ class NonlinearOperator:
         delta_a = self._artificial_diffusivity(u, dtau)
         top = float(delta_a.max(initial=0.0))
         if top > 0:
-            out *= np.exp(-dz * delta_a[:, None] * self._viscous[None, : p.shape[1]]).astype(out.real.dtype)
+            viscous = self._viscous[None, : p.shape[1]].astype(u.dtype)
+            out *= np.exp(-dz * delta_a[:, None] * viscous).astype(out.real.dtype, copy=False)
         return out, top

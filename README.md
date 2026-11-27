@@ -94,11 +94,11 @@ The dependency `numpy>=2.3.2; python_version >= '3.14'` prevents the combination
 ## Running
 
 ```
-pywave3d [nthreads] [options.json] [-o OUTDIR] [-q | -v] [--no-progress]
+pywave3d [nthreads] [options.json] [-o OUTDIR] [-q | -v] [--no-progress] [--precision {single,double}]
 python -m pywave3d 8 examples/water_focused.json -o out
 ```
 
-Without an options file, pyWave3D runs the default water case. It has 405 steps on a 168 × 168 grid and takes about 45 s on 8 threads. A progress bar tracks the march when the output is a terminal; `--no-progress` turns it off.
+Without an options file, pyWave3D runs the default water case. It has 405 steps on a 168 × 168 grid and takes about 45 s on 8 threads. A progress bar tracks the march when the output is a terminal; `--no-progress` turns it off. `--precision single` marches complex64 fields instead of complex128, which halves the memory; it overrides `Solver.precision`.
 
 From Python:
 
@@ -201,7 +201,7 @@ Keys are case-insensitive, dotted paths walk nested objects, and a value of the 
 | `Solver.ShockSmoothing` | artificial absorption against the oscillations that shocks cause; on when the block is present unless `enabled` is false. `type` `axial` (default) or `adaptive`. **axial** (Yuldashev and Khokhlova, *Acoust. Phys.* 57, 2011, eq. 11): the diffusivity is multiplied by $m(z) = 1 + (A-1)\,s\!\left(\frac{z - z_1}{\Delta z_1}\right) - (A-B)\,s\!\left(\frac{z - z_2}{\Delta z_2}\right)$, $s(x) = (1 + \tanh x)/2$, $z$ from the source plane: 1 before the focus, $A$ around it, $B$ after it. Keys `peak_multiplier` $A$ (5), `post_focal_multiplier` $B$ (1), `start` $z_1/F$ (0.96), `end` $z_2/F$ (1.03), `start_width` $\Delta z_1/F$ (0.01), `end_width` $\Delta z_2/F$ (0.01), `focal_length` $F$ (the transducer's `focusing_depth`). The geometry is the paper's; it set $A$ per source level (2.5 to 40) and gives no $B$, so $A = 5$, $B = 1$ are starting points. **adaptive** (Maxwell et al., *IEEE TUFFC* 64, 2017, eq. 5): in the Godunov step, each point whose shock is steeper than wanted gets the diffusivity of a Taylor shock with its jump $\Delta p$ and rise time $\tau_{sh}$, $\delta + \delta_a = \tau_{sh} \beta \Delta p / (4 \operatorname{artanh}(0.8) \rho_0)$. Key `rise_points` (7): $\tau_{sh}$ in steps $T/(2K)$ of the time grid. Both act even with `Adsorp` off and are left out of the heating rate |
 | `Solver.Metrics` | `focal_quantity` (`p_positive`), `harmonics` (4), `levels_dB` ([-6, -3, -12, -20]; the first is the main level), `hydrophone_diameter` (0 m: no averaging), `derating` (0.3 dB/(cm MHz)), `face_distance` (0.003 m, the plane for $A_{\mathrm{ER}}$) |
 | `Solver.Output` | `every` (record every $n$-th plane, 1), `plane_peaks` (true), `progress_bar` (true: a progress bar over the march when run in a terminal), `xyz` (points `{"name", "position"}`) |
-| `Solver.precision` | `double` (default) or `single` |
+| `Solver.precision` | `double` (default: complex128 fields) or `single` (complex64). The whole march runs at this precision: the field, the precomputed propagators and PML, the FFTs and the nonlinear step. The operators are computed in double precision and then rounded; the recorded axis, lines and metrics are kept in double precision |
 
 The reference file `options/woptions.json` sets `"NLN": false`, so it runs linear. A missing switch defaults to on.
 

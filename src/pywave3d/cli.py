@@ -1,4 +1,5 @@
-"""Command line: ``pywave3d [nthreads] [options.json] [-o DIR] [-q | -v] [--no-progress]``.
+"""Command line: ``pywave3d [nthreads] [options.json] [-o DIR] [-q | -v] [--no-progress]
+[--precision {single,double}]``.
 
 Without an options file the built-in default runs: a 50 W, 1 MHz focused transducer
 (radius 12.5 mm, focus 50 mm) in water, with nonlinearity and thermoviscous absorption.
@@ -13,7 +14,7 @@ import sys
 from pathlib import Path
 
 from pywave3d.options import Options
-from pywave3d.solver import simulate
+from pywave3d.solver import PRECISIONS, simulate
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -34,6 +35,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="no progress bar over the march (overrides Solver.Output.progress_bar)",
     )
+    p.add_argument(
+        "--precision",
+        choices=PRECISIONS,
+        default=None,
+        help="precision of the march: complex128 (double) or complex64 (single) fields "
+        "(overrides Solver.precision; default double)",
+    )
     return p
 
 
@@ -44,7 +52,9 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=level, format="%(message)s", stream=sys.stdout)
     try:
         opts = Options.load(args.options) if args.options is not None else Options({})
-        results = simulate(opts, workers=max(1, args.nthreads), progress_bar=args.progress_bar)
+        results = simulate(
+            opts, workers=max(1, args.nthreads), progress_bar=args.progress_bar, precision=args.precision
+        )
     except (OSError, TypeError, ValueError) as err:
         print(f"pywave3d: error: {err}", file=sys.stderr)
         return 1

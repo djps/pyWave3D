@@ -11,7 +11,7 @@ from beartype.roar import BeartypeCallHintParamViolation
 from scipy.special import jv
 
 import pywave3d as pw
-from pywave3d.nonlinear import NonlinearOperator, harmonics_of, waveform
+from pywave3d.nonlinear import NonlinearOperator, harmonics_of, peak_pressures, waveform
 
 F0 = 1e6
 P0 = 1e6
@@ -198,3 +198,84 @@ def test_adaptive_smoothing_leaves_smooth_waveforms_alone() -> None:
     np.testing.assert_array_equal(p, q)
     with pytest.raises(ValueError):
         pw.AdaptiveSmoothing(rise_points=0)
+
+
+def _dense_peaks(h: np.ndarray, nt: int = 1 << 14) -> tuple[np.ndarray, np.ndarray]:
+    w = waveform(h, nt)
+    return w.max(axis=0), w.min(axis=0)
+
+
+def test_peak_pressures_find_the_peak_between_samples() -> None:
+    """One harmonic peaking half-way between the 4 samples of a period: the samples alone give
+    cos(45 deg) = 0.71 of the amplitude; the refined peak is the amplitude."""
+    h = np.array([[np.exp(1j * np.pi / 4)]])
+    assert waveform(h, 4).max() == pytest.approx(np.cos(np.pi / 4))
+    pp, pm = peak_pressures(h)
+    assert pp[0] == pytest.approx(1.0, abs=1e-12)
+    assert pm[0] == pytest.approx(-1.0, abs=1e-12)
+
+
+@pytest.mark.parametrize("k", [1, 2, 3, 8, 32])
+def test_peak_pressures_match_dense_sampling(k: int) -> None:
+    """Random smooth spectra (falling as 1/n) of any shape, in both precisions. Dense samples
+    miss the peak too, by at most (dphi^2 / 2) sum n^2 |P_n|: the refined peak lies between the
+    dense sampled one and that much above it."""
+    rng = np.random.default_rng(k)
+    n = np.arange(1, k + 1)[:, None, None]
+    h = (rng.normal(size=(k, 5, 7)) + 1j * rng.normal(size=(k, 5, 7))) / n
+    nt = 1 << 14
+    ref_pp, ref_pm = _dense_peaks(h.reshape(k, -1), nt)
+    miss = 0.5 * (2 * np.pi / nt) ** 2 * (n**2 * np.abs(h)).sum(axis=0).ravel()
+    scale = np.abs(h).sum(axis=0).max()
+    pp, pm = peak_pressures(h)
+    assert pp.shape == pm.shape == (5, 7)
+    eps = 1e-12 * scale
+    assert np.all(pp.ravel() >= ref_pp - eps) and np.all(pp.ravel() <= ref_pp + miss + eps)
+    assert np.all(pm.ravel() <= ref_pm + eps) and np.all(pm.ravel() >= ref_pm - miss - eps)
+    pp32, pm32 = peak_pressures(h.astype(np.complex64), chunk=4)  # several chunks
+    assert pp32.dtype == pm32.dtype == np.float64
+    np.testing.assert_allclose(pp32, pp, rtol=0, atol=1e-6 * scale)
+    np.testing.assert_allclose(pm32, pm, rtol=0, atol=1e-6 * scale)
+
+
+def test_peak_pressures_of_a_sawtooth_are_not_below_the_samples() -> None:
+    """A shocked (sawtooth) spectrum: the refined peaks are at least the sampled ones and within
+    the Gibbs overshoot of the dense ones."""
+    k = 64
+    n = np.arange(1, k + 1)
+    h = (1j / n)[:, None]  # sawtooth, sum sin(n phi) / n
+    sampled = waveform(h, 4 * k)
+    pp, pm = peak_pressures(h)
+    ref_pp, ref_pm = _dense_peaks(h)
+    assert pp[0] >= sampled.max() and pm[0] <= sampled.min()
+    assert pp[0] == pytest.approx(ref_pp[0], rel=1e-3)
+    assert pm[0] == pytest.approx(ref_pm[0], rel=1e-3)
+
+
+def test_peak_pressures_of_nothing() -> None:
+    pp, pm = peak_pressures(np.zeros((3, 0), dtype=complex))
+    assert pp.shape == pm.shape == (0,)
+    pp, pm = peak_pressures(np.zeros((3, 2), dtype=complex))
+    np.testing.assert_array_equal(pp, 0.0)
+    np.testing.assert_array_equal(pm, 0.0)
+
+
+def test_peak_pressures_with_a_floor_refine_only_what_can_exceed_it() -> None:
+    """With a floor, every point whose peak may exceed it is exact; the others keep their sampled
+    value, which is not above the floor and within the bound of the true peak."""
+    rng = np.random.default_rng(7)
+    k = 6
+    n = np.arange(1, k + 1)[:, None]
+    h = (rng.normal(size=(k, 400)) + 1j * rng.normal(size=(k, 400))) / n**2
+    exact_pp, exact_pm = peak_pressures(h)
+    f_plus = np.quantile(exact_pp, 0.7) * np.ones(400)
+    f_minus = float(np.quantile(-exact_pm, 0.9))
+    pp, pm = peak_pressures(h, floor=(f_plus, f_minus), chunk=64)
+    miss = 0.5 * (2 * np.pi / (4 * k)) ** 2 / 4 * (n**2 * np.abs(h)).sum(axis=0)
+    above = exact_pp > f_plus
+    np.testing.assert_allclose(pp[above], exact_pp[above], rtol=1e-13)
+    assert np.all(pp[~above] <= f_plus[~above] + 1e-12) and np.all(exact_pp - pp <= miss + 1e-12)
+    np.testing.assert_allclose(pm[-exact_pm > f_minus], exact_pm[-exact_pm > f_minus], rtol=1e-13)
+    assert pp.max() == pytest.approx(exact_pp.max(), rel=1e-13)
+    assert pm.min() == pytest.approx(exact_pm.min(), rel=1e-13)
+    assert np.sum(np.abs(pp - exact_pp) > 1e-9) > 100  # most points below the floor were not refined

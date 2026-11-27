@@ -51,6 +51,7 @@ import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 from tqdm.auto import tqdm
@@ -67,6 +68,10 @@ from pywave3d.results import FocalQuantity, Results
 
 log = logging.getLogger(__name__)
 
+#: precision of the march: complex128 (double) or complex64 (single) fields
+Precision = Literal["single", "double"]
+PRECISIONS: tuple[Precision, ...] = ("single", "double")
+
 
 @dataclass
 class SolverSettings:
@@ -77,7 +82,9 @@ class SolverSettings:
         paraxial: use the parabolic (KZK) diffraction operator instead of the exact one.
         method, switch_threshold, amplitude_threshold, cfl: see :class:`NonlinearOperator`.
         harmonic_tolerance: harmonics below this fraction of the fundamental's maximum are
-            treated as zero (and not transformed) until the nonlinearity fills them.
+            treated as zero (and not transformed) until the nonlinearity fills them. It is
+            raised to 16 epsilons of the precision if lower (1.9e-6 in single precision; the
+            default 1e-10 stands in double).
         record_every: record every n-th plane (the last plane is always recorded).
         plane_peaks: also record the peak pressures over each whole plane.
         points: output points, ``(name, (x, y, z))``; recorded at the nearest grid point.
@@ -182,10 +189,18 @@ class SolverSettings:
             hydrophone_diameter=met.get("hydrophone_diameter", float, d.hydrophone_diameter),
             derating=met.get("derating", float, d.derating),
             face_distance=met.get("face_distance", float, d.face_distance),
-            single_precision=opts.get("precision", str, "double").lower() == "single",
+            single_precision=read_precision(opts),
             workers=workers,
             shock_smoothing=smoothing,
         )
+
+
+def read_precision(opts: Options) -> bool:
+    """``Solver.precision`` (``"double"``, the default, or ``"single"``): True for single."""
+    precision = opts.get("precision", str, "double").lower()
+    if precision not in PRECISIONS:
+        raise TypeError(f"options: '{opts.path}.precision' should be 'single' or 'double', not {precision!r}")
+    return precision == "single"
 
 
 class WaveSolver:
@@ -242,6 +257,11 @@ class WaveSolver:
             if s.nonlinearity and model.medium.nonlinearity > 0
             else None
         )
+        #: harmonics below this fraction of the fundamental's maximum are treated as zero: the
+        #: setting, but never below 16 epsilons of the precision, under which a harmonic is only
+        #: rounding noise (single precision would otherwise transform every harmonic from the
+        #: first steps on, its noise floor being ~1e-8 of the fundamental)
+        self.harmonic_tolerance = max(s.harmonic_tolerance, 16 * float(np.finfo(self.dtype).eps))
         self.field: ComplexArray = model.initial_field(self.grid, self.dtype)
         self.n_active = self._active_harmonics()
 
@@ -251,7 +271,7 @@ class WaveSolver:
         top = amp.max()
         if top == 0:
             return 1
-        nz = np.nonzero(amp > self.settings.harmonic_tolerance * top)[0]
+        nz = np.nonzero(amp > self.harmonic_tolerance * top)[0]
         return int(nz[-1]) + 1
 
     # -- the march -----------------------------------------------------------------------
@@ -316,11 +336,13 @@ class WaveSolver:
 
         log.info("Grid: %s", g.summary())
         log.info(
-            "Model: diffraction %s, nonlinearity %s, absorption %s, absorbing layer %s",
+            "Model: diffraction %s, nonlinearity %s, absorption %s, absorbing layer %s; %s precision (%s)",
             *(
                 "on" if v else "off"
                 for v in (s.diffraction, self.nonlinear is not None, s.absorption, s.absorbing_layer)
             ),
+            "single" if s.single_precision else "double",
+            np.dtype(self.dtype).name,
         )
         if self.smoothing is not None:
             sm = self.smoothing
@@ -427,7 +449,10 @@ class WaveSolver:
 
 
 def simulate(
-    options: str | Path | Options | None = None, workers: int = 1, progress_bar: bool | None = None
+    options: str | Path | Options | None = None,
+    workers: int = 1,
+    progress_bar: bool | None = None,
+    precision: Precision | None = None,
 ) -> Results:
     """Run a simulation from an options file (or node), or the water default if None.
 
@@ -437,6 +462,8 @@ def simulate(
         workers: threads for the FFTs.
         progress_bar: show the progress bar of the march; None takes it from the options
             (``Solver.Output.progress_bar``, default true).
+        precision: ``"single"`` or ``"double"`` for the march; None takes it from the options
+            (``Solver.precision``, default double).
     """
     if options is None:
         opts = Options({})
@@ -450,4 +477,8 @@ def simulate(
     settings = SolverSettings.from_options(solver_opts, workers)
     if progress_bar is not None:
         settings.progress_bar = progress_bar
+    if precision is not None:
+        if precision not in PRECISIONS:
+            raise ValueError(f"precision should be 'single' or 'double', not {precision!r}")
+        settings.single_precision = precision == "single"
     return WaveSolver(model, grid, settings).run()

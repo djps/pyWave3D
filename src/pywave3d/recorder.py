@@ -30,7 +30,7 @@ import numpy as np
 from pywave3d import iec
 from pywave3d._types import ComplexArray
 from pywave3d.grid import Grid
-from pywave3d.nonlinear import waveform
+from pywave3d.nonlinear import peak_pressures
 from pywave3d.results import FocalQuantity, Results
 
 log = logging.getLogger(__name__)
@@ -170,11 +170,9 @@ class PlaneRecorder:
         na = self.k if n_active is None else n_active
         r = self.n_planes
         ix, iy = self.axis_index
-        nt_peak = 4 * na  # exact: the waveform is band-limited to na harmonics
-        line_x = waveform(f[:na, :, iy], nt_peak, s.workers)
-        line_y = waveform(f[:na, ix, :], nt_peak, s.workers)
-        xz_pp, xz_pm = line_x.max(axis=0), line_x.min(axis=0)
-        yz_pp, yz_pm = line_y.max(axis=0), line_y.min(axis=0)
+        # the peaks of the waveforms themselves, not of samples of them (see peak_pressures)
+        xz_pp, xz_pm = peak_pressures(f[:na, :, iy], s.workers)
+        yz_pp, yz_pm = peak_pressures(f[:na, ix, :], s.workers)
         rows["z"].append(float(z))
         rows["axis"].append(f[:, ix, iy].astype(complex))
         rows["xz_pp"].append(xz_pp)
@@ -214,12 +212,19 @@ class PlaneRecorder:
             bound = np.abs(f[:na]).sum(axis=0)
             floor = min(max(xz_pp.max(), yz_pp.max()), -min(xz_pm.min(), yz_pm.min()))
             cand = (bound > self._max_pp) | (bound > floor)
-            plane = waveform(f[:na, cand], nt_peak, s.workers)  # (nt, ncand)
+            # refined only where a point may raise the map there or reach the plane's extremes
+            # known so far from the lines through the axis (elsewhere the sampled value, which
+            # is then known to change neither)
+            line_pp = float(max(xz_pp.max(), yz_pp.max()))
+            line_pm = float(-min(xz_pm.min(), yz_pm.min()))
+            cand_pp, cand_pm = peak_pressures(
+                f[:na, cand], s.workers, floor=(np.minimum(self._max_pp[cand], line_pp), line_pm)
+            )
             pmax = np.full((g.nx, g.ny), -np.inf)
-            pmax[cand] = plane.max(axis=0)
+            pmax[cand] = cand_pp
             np.maximum(self._max_pp, pmax, out=self._max_pp)
             pl_pp = float(max(pmax.max(), xz_pp.max(), yz_pp.max()))
-            pl_pm = float(min(plane.min(initial=0.0), xz_pm.min(), yz_pm.min()))
+            pl_pm = float(min(cand_pm.min(initial=0.0), xz_pm.min(), yz_pm.min()))
             if pl_pp > self._peak["value"]:
                 if pmax.max() >= pl_pp:
                     ii, jj = np.unravel_index(int(np.argmax(pmax)), pmax.shape)

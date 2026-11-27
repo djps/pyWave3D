@@ -26,7 +26,7 @@ import numpy as np
 from pywave3d import iec
 from pywave3d._types import ComplexArray, RealArray
 from pywave3d.grid import Grid
-from pywave3d.nonlinear import waveform
+from pywave3d.nonlinear import peak_pressures, waveform
 
 FocalQuantity = Literal["p_positive", "p_negative", "first_harmonic"]
 
@@ -188,10 +188,10 @@ class Results:
 
     def plane_maps(self, harmonics: ComplexArray) -> dict[str, RealArray]:
         """p+, p-, |P_n| and intensity over a plane of harmonics (K, nx, ny)."""
-        wave = waveform(harmonics, 4 * harmonics.shape[0])
+        p_positive, p_negative = peak_pressures(harmonics)
         return {
-            "p_positive": wave.max(axis=0),
-            "p_negative": wave.min(axis=0),
+            "p_positive": p_positive,
+            "p_negative": p_negative,
             "amplitude": np.abs(harmonics),
             "intensity": self.intensity(harmonics),
         }
