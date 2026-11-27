@@ -41,7 +41,7 @@ from pywave3d.recorder import PlaneRecorder, RecordSettings
 from pywave3d.results import Results
 from pywave3d.solver import SolverSettings, WaveSolver, simulate
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "AbsorbingLayer",
